@@ -1,62 +1,56 @@
 #!/usr/bin/env python3
 """
-SDPO (Self-Distillation Policy Optimization) backend for online continual learning.
+SDPO (Self-Distillation Policy Optimization) training loop for a tool-using coding agent.
 
-Core insight: When user denies a diff and gives feedback:
-    User: "fix the test"
-    Model: diff_1 -> User: "no, wrong file - bug is in foo.py"
-    Model: diff_2 -> User: "yes"
+This module is the “cookbook core”:
+- sample a tool-call action from the current policy
+- when the user provides a correction, build a feedback-conditioned self-teacher
+- score the *same sampled tokens* under teacher and student
+- train with `loss_fn="importance_sampling"` using per-token advantages derived from the logprob gap
 
-    SDPO Training:
-    - Sample once (diff_1) from the current policy (student).
-    - Build a self-teacher by conditioning the SAME model on the feedback.
-    - Evaluate the SAME sampled diff_1 tokens under both student and teacher (dense token-level signal).
-    - Distill teacher → student by minimizing per-token KL:
-        KL(student_next_token || stopgrad(teacher_next_token))
-      (often described as "reverse KL" in words).
-    - Intuition: if feedback makes the teacher less confident in wrong-file tokens, the student gets pushed away from them.
-
-The model learns to anticipate corrections without needing them at inference.
+Key invariant for clean credit assignment: teacher and student differ only by the appended feedback.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any
-
-# Avoid noisy warnings when forking subprocesses after tokenizers parallelism is initialized.
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import tinker
 import torch
 from tinker import types
 from tinker.types.tensor_data import TensorData
+from tinker_cookbook import checkpoint_utils, hyperparam_utils, model_info
 from tinker_cookbook.renderers import get_renderer
-from tinker_cookbook.renderers.base import TrainOnWhat
-from tinker_cookbook.supervised.common import compute_mean_nll, datum_from_model_input_weights
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
 from .tools import TOOL_SPECS
+
+# Avoid noisy warnings when forking subprocesses after tokenizers parallelism is initialized.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class SampledCompletion:
     """A completion with its logprobs, for training."""
+
     prompt_input: tinker.ModelInput
-    prompt_messages: list[dict[str, Any]]  # Full message list used to build prompt (includes prefix/tool defs)
+    prompt_messages: list[dict[str, Any]]
     tokens: list[int]
     logprobs: list[float]
-    prompt_len: int  # Token length of prompt_input
+    prompt_len: int
 
 
 @dataclass
 class SDPOConfig:
     """Configuration for SDPO training."""
+
     kl_coef: float = 1.0            # KL penalty coefficient
     is_clip: float = 2.0            # Optional IS ratio clipping (effective if doing off-policy updates)
-
-    # Prompt templates for teacher construction
     feedback_template: str = "User correction: {feedback}"
     reprompt_suffix: str = "Correctly solve the original question."
 
@@ -73,14 +67,15 @@ class SDPOEpisode:
     Tracks a single on-policy "approval episode":
     - One or more denied attempts (with correction text)
     """
+
     denied: list[SDPODenial] = field(default_factory=list)
 
 
-class SDPOSession:
+class ContinualSDPOSession:
     """
     Extended session with SDPO (Self-Distillation Policy Optimization) for online learning.
 
-    Extends the basic TinkerSession with:
+    Adds:
     - Episode tracking for SDPO training
     - Teacher prompt construction from feedback
     - Token-level reverse KL computation
@@ -102,7 +97,11 @@ class SDPOSession:
         # Training config
         enable_training: bool = False,
         lora_rank: int = 32,
-        learning_rate: float = 1e-5,
+        learning_rate: float | None = None,
+        # Checkpoint config
+        log_path: str = "/tmp/continualcode/sdpo",
+        save_every: int = 0,
+        ttl_seconds: int = 604800,
         # SDPO config
         sdpo_config: SDPOConfig | None = None,
     ) -> None:
@@ -115,7 +114,20 @@ class SDPOSession:
         self.temperature = temperature
         self.enable_training = enable_training
         self.lora_rank = lora_rank
-        self.learning_rate = learning_rate
+        self.log_path = log_path
+        self.save_every = save_every
+        self.ttl_seconds = ttl_seconds
+
+        # Resolve learning rate: explicit > hyperparam_utils > fallback
+        if learning_rate is not None:
+            self.learning_rate = learning_rate
+        else:
+            try:
+                self.learning_rate = hyperparam_utils.get_lr(self.model, is_lora=True)
+                logger.info(f"Using hyperparam_utils LR: {self.learning_rate:.2e}")
+            except (ValueError, Exception):
+                self.learning_rate = 1e-5
+                logger.info(f"hyperparam_utils.get_lr failed for {self.model}, using default LR: {self.learning_rate:.2e}")
 
         self.tool_specs = TOOL_SPECS if tool_specs is None else tool_specs
         self.system_prompt = system_prompt or (
@@ -132,7 +144,10 @@ class SDPOSession:
         )
 
         self.tokenizer = get_tokenizer(self.model)
-        self.renderer = get_renderer("qwen3_instruct", tokenizer=self.tokenizer)
+        # Use model_info to pick the right renderer instead of hardcoding
+        renderer_name = model_info.get_recommended_renderer_name(self.model)
+        logger.info(f"Using renderer: {renderer_name}")
+        self.renderer = get_renderer(renderer_name, tokenizer=self.tokenizer)
 
         self.service_client = tinker.ServiceClient(base_url=self.tinker_url)
         self.sampling_client: tinker.SamplingClient | None = None
@@ -154,12 +169,22 @@ class SDPOSession:
     async def init(self) -> None:
         """Initialize the session, setting up training/sampling clients."""
         if self.enable_training:
-            # Create LoRA training client
-            self.training_client = await self.service_client.create_lora_training_client_async(
-                base_model=self.model, rank=self.lora_rank
-            )
-            if self.checkpoint:
-                await self.training_client.load_state_async(self.checkpoint)
+            # Check for resume from checkpoint
+            resume_info = checkpoint_utils.get_last_checkpoint(self.log_path)
+            if resume_info:
+                self.training_client = self.service_client.create_training_client_from_state_with_optimizer(
+                    resume_info["state_path"]
+                )
+                self.train_steps = resume_info.get("train_steps", 0)
+                self.sdpo_steps = resume_info.get("sdpo_steps", 0)
+                logger.info(f"Resumed from checkpoint: train_steps={self.train_steps}, sdpo_steps={self.sdpo_steps}")
+            else:
+                # Create LoRA training client
+                self.training_client = await self.service_client.create_lora_training_client_async(
+                    base_model=self.model, rank=self.lora_rank
+                )
+                if self.checkpoint:
+                    await self.training_client.load_state_async(self.checkpoint)
             # Get sampling client from training client (shares weights)
             self.sampling_client = await self.training_client.save_weights_and_get_sampling_client_async("current")
         else:
@@ -178,7 +203,6 @@ class SDPOSession:
             )
             self._teacher_is_student = False
         elif self.teacher_model != self.model or not self.enable_training:
-            # If training is enabled and teacher_model==student model, reuse.
             self.teacher_sampling_client = await self.service_client.create_sampling_client_async(
                 base_model=self.teacher_model
             )
@@ -193,6 +217,22 @@ class SDPOSession:
         self.sampling_client = await self.training_client.save_weights_and_get_sampling_client_async("current")
         if self._teacher_is_student:
             self.teacher_sampling_client = self.sampling_client
+
+    def _maybe_save_checkpoint(self) -> None:
+        """Save checkpoint if save_every is set and we've hit the interval."""
+        if self.save_every <= 0 or self.training_client is None:
+            return
+        total_steps = self.train_steps + self.sdpo_steps
+        if total_steps > 0 and total_steps % self.save_every == 0:
+            checkpoint_utils.save_checkpoint(
+                training_client=self.training_client,
+                name=f"{total_steps:06d}",
+                log_path=self.log_path,
+                kind="state",
+                loop_state={"train_steps": self.train_steps, "sdpo_steps": self.sdpo_steps},
+                ttl_seconds=self.ttl_seconds,
+            )
+            logger.info(f"Saved checkpoint at step {total_steps}")
 
     @staticmethod
     async def _result(obj: Any) -> Any:
@@ -222,7 +262,7 @@ class SDPOSession:
         """Reset SDPO episode state (call after finishing an approval episode)."""
         self._sdpo_episode = None
 
-    def record_sdpo_denial(self, completion: SampledCompletion | None, feedback: str | None) -> None:
+    def record_denial(self, completion: SampledCompletion | None, feedback: str | None) -> None:
         """Record a denied attempt with correction text (the core SDPO signal)."""
         if completion is None:
             return
@@ -233,6 +273,10 @@ class SDPOSession:
             self._sdpo_episode = SDPOEpisode()
         self._sdpo_episode.denied.append(SDPODenial(completion=completion, feedback=fb))
 
+    def record_sdpo_denial(self, completion: SampledCompletion | None, feedback: str | None) -> None:
+        """Backward-compatible alias for record_denial."""
+        self.record_denial(completion, feedback)
+
     # -------------------------------------------------------------------------
     # Sampling
     # -------------------------------------------------------------------------
@@ -242,7 +286,7 @@ class SDPOSession:
     ) -> list[tuple[dict[str, Any], bool, SampledCompletion | None]]:
         """Sample N completions from the same prompt."""
         if self.sampling_client is None:
-            raise RuntimeError("SDPOSession not initialized. Call init() first.")
+            raise RuntimeError("ContinualSDPOSession not initialized. Call init() first.")
         if num_samples <= 0:
             raise ValueError(f"num_samples must be > 0, got {num_samples}")
 
@@ -301,7 +345,7 @@ class SDPOSession:
         - an instruction to solve correctly
 
         This keeps credit assignment clean: teacher/student differ ONLY by the added feedback,
-        but we score the student's *actual sampled tokens* under both.
+        but we score the student's actual sampled tokens under both.
         """
         parts: list[str] = []
         parts.append(self.sdpo_config.feedback_template.format(feedback=feedback))
@@ -482,6 +526,7 @@ class SDPOSession:
         await self._refresh_sampling_client()
 
         self.sdpo_steps += 1
+        self._maybe_save_checkpoint()
 
         # Compute metrics
         metrics = fwd_bwd.metrics or {}
@@ -505,170 +550,6 @@ class SDPOSession:
         self._sdpo_episode = None
 
         return sdpo_metrics
-
-    # -------------------------------------------------------------------------
-    # Standard RL Training (from parent TinkerSession)
-    # -------------------------------------------------------------------------
-
-    async def train_on_episode(self, steps: list[SampledCompletion], rewards: list[float]) -> dict[str, float]:
-        """
-        Train online on an episode/trajectory using importance-weighted policy gradient.
-
-        Each step is an action sampled under the current policy; we push up/down that action
-        proportional to (reward - baseline).
-        """
-        if self.training_client is None:
-            return {}
-
-        if len(steps) != len(rewards):
-            raise ValueError(f"steps/rewards length mismatch: {len(steps)} vs {len(rewards)}")
-        if not steps:
-            return {}
-
-        t = len(steps)
-        mean_reward = sum(rewards) / t
-        baseline = mean_reward if t > 1 else 0.0
-        step_advantages = [r - baseline for r in rewards]
-
-        datums: list[types.Datum] = []
-        per_step_mean_logprob: list[float] = []
-
-        for comp, advantage in zip(steps, step_advantages):
-            per_step_mean_logprob.append(sum(comp.logprobs) / max(1, len(comp.logprobs)))
-
-            # Build full token sequence and right-shift for importance_sampling loss.
-            student_full = comp.prompt_input.append(types.EncodedTextChunk(tokens=comp.tokens))
-            full_tokens = list(student_full.to_ints())
-            prompt_len = comp.prompt_len
-
-            input_tokens = full_tokens[:-1]
-            target_tokens = full_tokens[1:]
-
-            full_sampling_lp = [0.0] * prompt_len + list(comp.logprobs)
-            full_advantages = [0.0] * prompt_len + [advantage] * len(comp.tokens)
-
-            aligned_sampling_lp = full_sampling_lp[1:]
-            aligned_advantages = full_advantages[1:]
-
-            min_len = min(len(input_tokens), len(target_tokens), len(aligned_sampling_lp), len(aligned_advantages))
-            input_tokens = input_tokens[:min_len]
-            target_tokens = target_tokens[:min_len]
-            aligned_sampling_lp = aligned_sampling_lp[:min_len]
-            aligned_advantages = aligned_advantages[:min_len]
-
-            datum = types.Datum(
-                model_input=types.ModelInput.from_ints(input_tokens),
-                loss_fn_inputs={
-                    "target_tokens": TensorData.from_torch(torch.tensor(target_tokens, dtype=torch.int64)),
-                    "logprobs": TensorData.from_torch(torch.tensor(aligned_sampling_lp, dtype=torch.float32)),
-                    "advantages": TensorData.from_torch(torch.tensor(aligned_advantages, dtype=torch.float32)),
-                },
-            )
-            datums.append(datum)
-
-        # Forward-backward with importance sampling loss
-        fwd_future = await self.training_client.forward_backward_async(datums, loss_fn="importance_sampling")
-
-        # Optimizer step
-        adam_params = types.AdamParams(
-            learning_rate=self.learning_rate,
-            beta1=0.9,
-            beta2=0.95,
-            eps=1e-8,
-        )
-        optim_future = await self.training_client.optim_step_async(adam_params)
-
-        fwd_bwd = await self._result(fwd_future)
-        await self._result(optim_future)
-
-        # Compute approx KL for diagnostics
-        approx_kl = 0.0
-        ratio_mean = 1.0
-        try:
-            fwd_after_future = await self.training_client.forward_async(
-                datums, loss_fn="importance_sampling"
-            )
-            fwd_after = await self._result(fwd_after_future)
-            old_logps: list[torch.Tensor] = []
-            new_logps: list[torch.Tensor] = []
-            for i, out in enumerate(fwd_after.loss_fn_outputs):
-                td = out.get("logprobs")
-                if td is None:
-                    continue
-                new_lp = td.to_torch().flatten().to(torch.float32)
-                old_lp = datums[i].loss_fn_inputs["logprobs"].to_torch().flatten().to(torch.float32)
-                adv = datums[i].loss_fn_inputs["advantages"].to_torch().flatten().to(torch.float32)
-                mask = adv != 0
-                if mask.any():
-                    new_logps.append(new_lp[mask])
-                    old_logps.append(old_lp[mask])
-            if old_logps and new_logps:
-                old_cat = torch.cat(old_logps)
-                new_cat = torch.cat(new_logps)
-                approx_kl = (old_cat - new_cat).mean().item()
-                ratio_mean = torch.exp(new_cat - old_cat).mean().item()
-        except Exception:
-            pass
-
-        # Update sampling client to use new weights
-        await self._refresh_sampling_client()
-
-        self.train_steps += 1
-
-        metrics = fwd_bwd.metrics or {}
-        loss_sum = metrics.get("loss:sum") if isinstance(metrics, dict) else None
-        if loss_sum is None and isinstance(metrics, dict):
-            loss_sum = metrics.get("loss")
-
-        return {
-            "step": float(self.train_steps),
-            "t": float(t),
-            "reward_sum": float(sum(rewards)),
-            "reward_mean": float(mean_reward),
-            "baseline": float(baseline),
-            "adv_mean": float(sum(step_advantages) / t),
-            "logprob_mean": float(sum(per_step_mean_logprob) / t),
-            "loss:sum": float(loss_sum) if loss_sum is not None else 0.0,
-            "approx_kl": float(approx_kl),
-            "ratio_mean": float(ratio_mean),
-        }
-
-    def train_sft_on_messages(self, messages: list[dict[str, Any]]) -> dict[str, float]:
-        """Supervised update on the last assistant message."""
-        if self.training_client is None:
-            return {}
-
-        model_input, weights = self.renderer.build_supervised_example(
-            messages, train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE
-        )
-        datum = datum_from_model_input_weights(model_input, weights, max_length=None)
-
-        fwd_bwd = self.training_client.forward_backward([datum], loss_fn="cross_entropy").result()
-        adam_params = types.AdamParams(
-            learning_rate=self.learning_rate,
-            beta1=0.9,
-            beta2=0.95,
-            eps=1e-8,
-        )
-        self.training_client.optim_step(adam_params).result()
-        self._refresh_sampling_client()
-
-        self.train_steps += 1
-
-        logprobs = [x.get("logprobs") for x in fwd_bwd.loss_fn_outputs]
-        logprobs_td = [x for x in logprobs if x is not None]
-        weights_td = datum.loss_fn_inputs["weights"]
-        train_nll = (
-            compute_mean_nll(logprobs_td, [weights_td] * len(logprobs_td)) if logprobs_td else float("nan")
-        )
-        metrics = fwd_bwd.metrics or {}
-        loss_sum = metrics.get("loss:sum", metrics.get("loss", 0.0)) if isinstance(metrics, dict) else 0.0
-        return {
-            "step": float(self.train_steps),
-            "sft": 1.0,
-            "loss:sum": float(loss_sum),
-            "nll": float(train_nll),
-        }
 
     # -------------------------------------------------------------------------
     # Conversation Management

@@ -1,7 +1,8 @@
-"""
-continualcode — Self-improving coding agent with online SDPO.
-"""
+"""continualcode — self-improving coding agent with online SDPO."""
 
-__version__ = "0.3.0"
+__version__ = "0.5.0"
 
-from .train import SDPOConfig, SDPOSession
+from .cli import Config
+from .train import SDPOConfig, ContinualSDPOSession
+
+__all__ = ["Config", "SDPOConfig", "ContinualSDPOSession", "__version__"]

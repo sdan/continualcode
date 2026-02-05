@@ -25,7 +25,7 @@ except Exception:  # pragma: no cover
 
 @dataclass
 class ToolResult:
-    """Structured tool result with feedback for SDPO-style learning."""
+    """Structured tool result with feedback for rich textual feedback."""
     output: str
     success: bool
     feedback: str | None = None
@@ -293,7 +293,7 @@ def tool_bash(args: dict[str, Any]) -> ToolResult:
         return _error_result(f"error: {e}", feedback=f"Command failed: {e}")
 
 def tool_execute(args: dict[str, Any]) -> ToolResult:
-    """Alias for bash command execution (Codex-style execute tool)."""
+    """Alias for bash command execution"""
     return tool_bash(args)
 
 

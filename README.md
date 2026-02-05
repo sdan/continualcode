@@ -1,86 +1,113 @@
-# continualcode
+# Continual Code
 
-Self-improving coding agent with online SDPO (Self-Distillation Policy Optimization).
+We provide a small library and CLI for building a **self‑improving coding agent** with **online SDPO (Self‑Distillation Policy Optimization)** on top of **Tinker**.
 
-The agent learns from your corrections in real-time: when you deny a tool call and explain why, the model trains on that feedback immediately — no offline dataset curation needed.
+- `continualcode` is a CLI coding agent with tool use (`read`, `write`, `edit_lines`, `glob`, `grep`, `bash`/`execute`). You approve or deny each tool call.
+- When you deny with a correction (or a tool fails and you correct it), the agent performs an immediate SDPO update and retries in the same session.
 
-## Install
+References:
+- SDPO project page: https://self-distillation.github.io/SDPO
+- SDPO paper: https://arxiv.org/abs/2601.20802
+- Tinker: https://thinkingmachines.ai/tinker
+
+## Installation
+
+1. Create a Tinker API key from the console and export it as `TINKER_API_KEY`.
+2. Install the package.
 
 ```bash
 pip install continualcode
+export TINKER_API_KEY=<your-key>
 ```
 
 ## Quick start
 
 ```bash
-export TINKER_API_KEY=<your-key>
 continualcode
 ```
 
-## CLI flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--model` | `Qwen/Qwen3-4B-Instruct-2507` | Base model |
-| `--checkpoint` | — | LoRA checkpoint path |
-| `--teacher-model` | same as model | Teacher model for SDPO |
-| `--teacher-checkpoint` | — | Teacher checkpoint |
-| `--tinker-url` | — | Custom Tinker API URL |
-| `--tinker-api-key` | `$TINKER_API_KEY` | API key |
-| `--max-tokens` | 4096 | Max generation tokens |
-| `--temperature` | 0.7 | Sampling temperature |
-| `--no-training` | false | Inference only |
-| `--no-sdpo` | false | Disable SDPO |
-| `--enable-rl` | false | Enable RL training |
-| `--lora-rank` | 32 | LoRA rank |
-| `--learning-rate` | 1e-5 | Learning rate |
-| `--kl-coef` | 1.0 | KL penalty coefficient |
-| `--is-clip` | 2.0 | IS ratio clipping |
-| `--auto-approve-readonly` | false | Auto-approve read/glob/grep |
-
-## TUI controls
-
-- **y**: Approve tool call
-- **n**: Deny (requires correction text)
-- **e**: Edit tool args in `$EDITOR`
-- **/c**: Clear conversation
-- **/metrics**: Show training metrics
-- **/q**: Quit
-
-## Python API
-
-```python
-from continualcode import SDPOConfig, SDPOSession
-
-session = SDPOSession(
-    model="Qwen/Qwen3-4B-Instruct-2507",
-    enable_training=True,
-    sdpo_config=SDPOConfig(kl_coef=1.0),
-)
-await session.init()
-
-# Sample completions
-message, ok, completion = await session.sample()
-
-# Record denials and train
-session.record_sdpo_denial(completion, "wrong file")
-metrics = await session.train_sdpo()
-```
-
-## How SDPO works
+Example interaction:
 
 ```
-User: "fix the test"
-Model: diff_1 -> User: "no, wrong file - bug is in foo.py"
-
-SDPO Training (per denied attempt):
-- Student context = the exact prompt snapshot that produced diff_1
-- Teacher context = that same snapshot + feedback (and an instruction like "solve correctly")
-- Evaluate the SAME sampled diff_1 tokens under both student and teacher (dense, token-level signal)
-- Distill teacher → student by minimizing per-token KL:
-  KL(student_next_token || stopgrad(teacher_next_token))
-  which is equivalent to an importance-sampling style loss with advantages like:
-  adv[t] = -kl_coef * (student_lp[t] - teacher_lp[t])
+You: "fix the test"
+Agent proposes: write(test.py, ...)  # overwrites the file
+You: n → "use edit_lines; don't overwrite"
+  → SDPO update runs immediately
+  → agent retries with updated weights
 ```
 
-The model learns to anticipate corrections without needing them at inference time.
+## Code layout
+
+- `continualcode/train.py`: SDPO training loop (teacher prompt, logprob scoring, `importance_sampling` update, sampler refresh).
+- `continualcode/tui.py`: interactive CLI (approve/deny/edit args, correction prompt, metrics).
+- `continualcode/tools.py`: tool implementations + structured tool feedback.
+- `demo/`: a tiny project to run “deny → train → retry” end-to-end.
+
+## How SDPO works (in this repo)
+
+SDPO converts text feedback (“wrong file”, “read first”, “use edit_lines”) into a dense training signal.
+
+Per denied attempt:
+1. **Student**: the policy that sampled the tool‑call tokens.
+2. **Self‑teacher**: the same model, conditioned on your correction text.
+3. **Dense credit assignment**: evaluate the **same sampled tokens** under both student and teacher (no re‑sampling).
+4. **Update**: distill teacher → student by minimizing per‑token KL along the sampled rollout:
+
+   `KL(student_next_token || stopgrad(teacher_next_token))`
+
+Equivalently (the view used in code), we compute token advantages from the logprob gap:
+`adv[t] = -kl_coef * (student_lp[t] - teacher_lp[t])`,
+then train with `loss_fn="importance_sampling"` using the student sampling logprobs as the behavior policy.
+
+Learning speed is empirical (model/task dependent), so don’t assume a fixed number of corrections.
+
+## Demo
+
+We include a tiny project in `demo/` to show online updates:
+
+```bash
+cd demo/
+export TINKER_API_KEY=<your-key>
+python -m continualcode
+```
+
+See `demo/README.md` for the walkthrough.
+
+## Documentation
+
+This repo is intentionally small. For the underlying training/sampling APIs, see the Tinker docs:
+https://tinker-docs.thinkingmachines.ai/training-sampling
+
+## Configuration
+
+```bash
+continualcode --help
+```
+
+`continualcode` uses `chz` config‑style arguments (pass `key=value`).
+
+Examples:
+
+```bash
+# inference only
+continualcode enable_training=false
+
+# change base model + LoRA rank
+continualcode model_name=Qwen/Qwen3-4B-Instruct-2507 lora_rank=64
+
+# enable checkpointing every 10 SDPO/RL steps (writes to /tmp by default)
+continualcode save_every=10
+```
+
+Common pitfalls:
+- **One tool call per message**: SDPO credit assignment assumes one tool call per assistant message.
+- **Teacher compatibility**: a separate teacher must be tokenizer‑compatible with the student (it scores the student’s token IDs). If unsure, prefer a teacher checkpoint from the same base model.
+
+## Citation
+
+```bibtex
+@misc{continualcode,
+  title = {continualcode: online SDPO for coding agents},
+  url = {https://github.com/sdan/continualcode},
+}
+```

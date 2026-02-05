@@ -4,16 +4,31 @@ build-backend = "hatchling.build"
 
 [project]
 name = "continualcode"
-version = "0.3.0"
+version = "0.5.0"
 description = "Self-improving coding agent with online SDPO (Self-Distillation Policy Optimization)"
 requires-python = ">=3.10"
 dependencies = [
+    "chz",
     "tinker>=0.7",
     "tinker-cookbook>=0.1",
     "torch",
 ]
-readme = "README.md"
+readme = { file = "README.md", content-type = "text/markdown" }
 license = "MIT"
+keywords = ["sdpo", "self-distillation", "coding-agent", "online-learning", "tinker"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Homepage = "https://github.com/sdan/continualcode"
+Documentation = "https://github.com/sdan/continualcode#readme"
+Repository = "https://github.com/sdan/continualcode"
+Issues = "https://github.com/sdan/continualcode/issues"
 
 [project.scripts]
-continualcode = "continualcode.cli:main"
+continualcode = "continualcode.cli:_entrypoint"
