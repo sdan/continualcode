@@ -237,7 +237,6 @@ total     = pg_loss + kl_loss              # backward through LoRA only</pre>
 
   <p>The entire step — teacher forward pass, advantages, backward, optimizer step — adds ~2-3s latency on a single GPU with an 8B model. Imperceptible when you just typed a correction.</p>
 
-  <!-- pipeline diagram -->
   <div class="pipeline" id="pipeline-diagram">
     <div class="pipeline-flow" style="margin-bottom: 0;">
       <div class="pn" style="--i:0"><span class="pn-icon">1</span><span class="pn-t">Student</span><span class="pn-d">samples on-policy</span></div>
@@ -256,7 +255,6 @@ total     = pg_loss + kl_loss              # backward through LoRA only</pre>
     </div>
   </div>
 
-  <!-- advantage visual -->
   <div class="adv" id="adv-viz">
     <div class="adv-box">
       <div class="adv-label">Scalar reward (RL)</div>
@@ -285,7 +283,7 @@ total     = pg_loss + kl_loss              # backward through LoRA only</pre>
 
   <h2>Limitations</h2>
 
-  <p>Tinker returns scalar logprobs, not full distributions — we're limited to reverse KL via the logprob gap (no forward KL, no JSD interpolation). No EMA teacher (Tinker doesn't expose weight-level ops) — teacher update is instant (τ=1.0 vs paper's τ=0.05), more aggressive but fine for single-step updates. Credit assignment assumes one tool call per message.</p>
+  <p>The training API returns scalar logprobs, not full distributions — we're limited to reverse KL via the logprob gap (no forward KL, no JSD interpolation). No EMA teacher (the API doesn't expose weight-level ops) — teacher update is instant (τ=1.0 vs paper's τ=0.05), more aggressive but fine for single-step updates. Credit assignment assumes one tool call per message.</p>
 
   <h2>Research lineage</h2>
 

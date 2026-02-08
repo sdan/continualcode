@@ -248,7 +248,7 @@ async def sample_and_grade_group(
     prompt_len = model_input.length
 
     # Sample N rollouts in a single API call.
-    # No semaphore here — Tinker API handles its own concurrency.
+    # No semaphore here — the API handles its own concurrency.
     # The sem only throttles sandbox_check_correctness calls below.
     response: types.SampleResponse = await sampling_client.sample_async(
         prompt=model_input,

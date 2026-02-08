@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Core tool implementations and schemas shared by tinkercode harnesses.
+Tool implementations for continualcode.
 
-Tool names intentionally match the "Claude Code"-style set:
-read, write, edit, edit_lines, glob, grep, bash
+Tools: read, write, edit, edit_lines, glob, grep, bash.
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    # Only required by the Tinker renderer; keep optional for simple imports.
+    # Optional import for renderer integration.
     from tinker_cookbook.renderers import ToolSpec
 except Exception:  # pragma: no cover
     ToolSpec = dict  # type: ignore[misc,assignment]

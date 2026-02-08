@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-SDPO (Self-Distillation Policy Optimization) training loop for a tool-using coding agent.
+SDPO (Self-Distillation Policy Optimization) training loop for continualcode.
 
-This module is the “cookbook core”:
-- sample a tool-call action from the current policy
-- when the user provides a correction, build a feedback-conditioned self-teacher
-- score the *same sampled tokens* under teacher and student
-- train with `loss_fn="importance_sampling"` using per-token advantages derived from the logprob gap
+On each denied tool call:
+- build a feedback-conditioned self-teacher (same model + correction context)
+- score the same sampled tokens under teacher and student
+- train with importance_sampling using per-token KL advantages
 
-Key invariant for clean credit assignment: teacher and student differ only by the appended feedback.
+Key invariant: teacher and student differ only by the appended feedback.
 """
 
 from __future__ import annotations
@@ -102,7 +101,7 @@ class SDPOEpisode:
 
 
 async def _result(obj: Any) -> Any:
-    """Normalize Tinker Future-like objects: await .result_async() if present, else return as-is."""
+    """Normalize async future objects: await .result_async() if present, else return as-is."""
     result_async = getattr(obj, "result_async", None)
     if callable(result_async):
         return await result_async()
@@ -200,7 +199,7 @@ def build_is_datum(
     tokens = comp.tokens
     prompt_len = comp.prompt_len
 
-    # Build full sequence and right-shift using cookbook utility (preserves chunk structure).
+    # Build full sequence and right-shift (preserves chunk structure).
     student_full = comp.prompt_input.append(types.EncodedTextChunk(tokens=tokens))
     input_model_input, target_tokens = create_rightshifted_model_input_and_leftshifted_targets(
         list(student_full.chunks)

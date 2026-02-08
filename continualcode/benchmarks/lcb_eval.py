@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-LiveCodeBench-style evaluation using the DeepCoder+LCB mix from tinker_cookbook.
+LiveCodeBench evaluation.
 
 Runs pass@1 (default) and optionally pass@k by sampling multiple completions
-per problem and checking correctness with the same sandboxed runner as the
-code_rl recipe.
+per problem and checking correctness via sandboxed execution.
 """
 
 from __future__ import annotations
