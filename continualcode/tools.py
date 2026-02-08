@@ -234,6 +234,16 @@ def tool_edit_lines(args: dict[str, Any]) -> ToolResult:
 
 def tool_glob(args: dict[str, Any]) -> ToolResult:
     base = args.get("path", ".") or "."
+    if os.path.isabs(base):
+        return _error_result(
+            f"error: absolute path not allowed: {base}",
+            feedback=f"Use a relative path (e.g., 'demo' not '/demo'). Current directory: {os.getcwd()}",
+        )
+    if not os.path.isdir(base):
+        return _error_result(
+            f"error: directory not found: {base}",
+            feedback=f"Directory '{base}' does not exist. Use glob with pat='**/*' to explore.",
+        )
     pattern = (str(base) + "/" + args["pat"]).replace("//", "/")
     files = globlib.glob(pattern, recursive=True)
     files = sorted(
@@ -254,6 +264,16 @@ def tool_grep(args: dict[str, Any]) -> ToolResult:
         )
 
     base = args.get("path", ".") or "."
+    if os.path.isabs(base):
+        return _error_result(
+            f"error: absolute path not allowed: {base}",
+            feedback=f"Use a relative path (e.g., 'demo' not '/demo'). Current directory: {os.getcwd()}",
+        )
+    if not os.path.isdir(base):
+        return _error_result(
+            f"error: directory not found: {base}",
+            feedback=f"Directory '{base}' does not exist. Use glob to find the right path.",
+        )
     hits: list[str] = []
 
     for filepath in globlib.glob(str(base) + "/**", recursive=True):

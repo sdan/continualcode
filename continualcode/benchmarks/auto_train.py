@@ -155,9 +155,9 @@ class AutoTrainConfig:
     # Fallback template when llm_feedback=False
     feedback_template: str = "Code failed with error:\n{error}\n\nFix the code."
     # Curriculum: skip problems the model has already solved
-    skip_solved: bool = True
+    skip_solved: bool = False
     # Held-out eval
-    eval_every: int = 10                        # eval every N SDPO steps (0 = disabled)
+    eval_every: int = 1                         # eval every N SDPO steps (0 = disabled)
     eval_size: int = 50                         # number of eval problems
     eval_split: Literal["train", "test"] = "test"
     # Wandb (optional — set project name to enable)
@@ -230,10 +230,7 @@ async def sample_and_grade_group(
     cfg: AutoTrainConfig,
     sandbox_sem: asyncio.Semaphore,
 ) -> list[GradeResult]:
-    """Sample N rollouts for one problem, grade all, attach group-centered GRPO rewards.
-
-    Returns a list of N GradeResults, each with completion.reward set to the
-    centered reward (pass=1, fail=0, then subtract group mean).
+    """Sample N rollouts for one problem and grade all completions.
 
     sandbox_sem throttles concurrent sandbox_check_correctness calls (not API sampling).
     """
@@ -311,13 +308,6 @@ async def sample_and_grade_group(
         )
 
     results = await asyncio.gather(*[_grade_seq(seq) for seq in response.sequences])
-
-    # Compute group-centered GRPO rewards (only over gradeable rollouts)
-    gradeable = [(r, 1.0 if r.passed else 0.0) for r in results if r.completion is not None]
-    if gradeable:
-        mean_reward = sum(raw for _, raw in gradeable) / len(gradeable)
-        for r, raw in gradeable:
-            r.completion.reward = raw - mean_reward
 
     return list(results)
 
@@ -565,9 +555,15 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
     llm_sem = asyncio.Semaphore(cfg.llm_feedback_concurrency)
     n_batches = (len(indices) + cfg.batch_size - 1) // cfg.batch_size
 
+    if cfg.train_signal != "pure_sdpo":
+        raise ValueError(
+            f"train_signal={cfg.train_signal!r} is not supported in this benchmark path. "
+            "Use train_signal='pure_sdpo'."
+        )
+
     logger.info(
         f"Starting auto-train: {n_batches} batches, num_rollouts={cfg.num_rollouts}, "
-        f"llm_feedback={cfg.llm_feedback}, train_signal={cfg.train_signal}"
+        f"llm_feedback={cfg.llm_feedback}"
     )
     logger.info(f"  Metrics: {metrics_path}")
     logger.info(f"  Samples: {samples_path}")
@@ -580,11 +576,15 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
     total_graded = 0
     total_tokens_generated = 0
     solved_indices: set[int] = set()  # curriculum: track solved problems
-    # Accumulate trainable completions: failures (for KL+GRPO) and passes (for GRPO-only)
+    # Accumulate trainable failures (mixed groups only) and pass-context for solution demos.
     accumulated_failures: list[GradeResult] = []
-    accumulated_passes: list[GradeResult] = []
-    # In pure_sdpo, we still keep pass rollouts for solution demos (not reward training).
     accumulated_pass_context: list[GradeResult] = []
+    # Aggregated training-quality stats for the pending SDPO step.
+    accumulated_total_groups = 0
+    accumulated_mixed_groups = 0
+    accumulated_skipped_all_fail_groups = 0
+    accumulated_total_failures = 0
+    accumulated_eligible_failures = 0
     # Per-problem difficulty tracking: {problem_idx: {"attempts": int, "first_solve_step": int|None}}
     problem_tracker: dict[int, dict[str, Any]] = {}
     # Group-level stats for GRPO
@@ -610,9 +610,14 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
         group_results: list[list[GradeResult]] = await asyncio.gather(*group_tasks)
         t_sampled = time.monotonic()
 
-        # Flatten and compute group-level GRPO metrics
+        # Flatten groups and compute trainability stats.
         results: list[GradeResult] = []
         batch_group_rewards: list[float] = []
+        eligible_failures_batch: list[GradeResult] = []
+        pass_context_batch: list[GradeResult] = []
+        batch_mixed_groups = 0
+        batch_skipped_all_fail_groups = 0
+        batch_total_failures = 0
         for group in group_results:
             results.extend(group)
             group_passes = sum(1 for r in group if r.passed)
@@ -621,6 +626,21 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
             if group_passes > 0 and group_fails > 0:
                 total_groups_with_variance += 1
             batch_group_rewards.append(group_passes / max(1, len(group)))
+
+            group_failures = [r for r in group if (not r.passed) and r.completion is not None]
+            group_pass_context = [r for r in group if r.passed and bool(r.response_text)]
+            batch_total_failures += len(group_failures)
+            pass_context_batch.extend(group_pass_context)
+            if group_failures:
+                if group_pass_context:
+                    batch_mixed_groups += 1
+                    eligible_failures_batch.extend(group_failures)
+                else:
+                    batch_skipped_all_fail_groups += 1
+
+        batch_eligible_failures = len(eligible_failures_batch)
+        mixed_group_fraction = batch_mixed_groups / max(1, len(group_results))
+        eligible_failure_fraction = batch_eligible_failures / max(1, batch_total_failures)
 
         # Tally and log per-sample results
         batch_passed = 0
@@ -647,7 +667,6 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
                 "batch_idx": batch_idx,
                 "problem_idx": r.idx,
                 "passed": is_pass,
-                "reward": r.completion.reward if r.completion else None,
                 "response_tokens": r.response_tokens,
                 "has_code": r.code is not None,
                 "error_preview": r.error[:200] if r.error else None,
@@ -656,37 +675,14 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
             samples_f.write(json.dumps(sample_entry) + "\n")
         samples_f.flush()
 
-        # Collect trainable completions.
-        # pure_sdpo: include all failures with logprobs, independent of centered GRPO reward.
-        # hybrid: keep existing GRPO-centered filtering and reward-only pass updates.
-        if cfg.train_signal == "pure_sdpo":
-            new_failures = [
-                r for r in results
-                if not r.passed and r.completion is not None
-            ]
-            for r in new_failures:
-                r.completion.reward = None
-            new_passes = []
-            # Keep passes as teacher context only (sibling solution demonstrations).
-            new_pass_context = [
-                r for r in results
-                if r.passed and r.completion is not None and r.response_text
-            ]
-        else:
-            new_failures = [
-                r for r in results
-                if not r.passed and r.completion is not None
-                and r.completion.reward is not None and r.completion.reward != 0.0
-            ]
-            new_passes = [
-                r for r in results
-                if r.passed and r.completion is not None
-                and r.completion.reward is not None and r.completion.reward != 0.0
-            ]
-            new_pass_context = []
-        accumulated_failures.extend(new_failures)
-        accumulated_passes.extend(new_passes)
-        accumulated_pass_context.extend(new_pass_context)
+        # Accumulate only failures from mixed groups to ensure sibling solution context.
+        accumulated_failures.extend(eligible_failures_batch)
+        accumulated_pass_context.extend(pass_context_batch)
+        accumulated_total_groups += len(group_results)
+        accumulated_mixed_groups += batch_mixed_groups
+        accumulated_skipped_all_fail_groups += batch_skipped_all_fail_groups
+        accumulated_total_failures += batch_total_failures
+        accumulated_eligible_failures += batch_eligible_failures
         total_passed += batch_passed
         total_graded += len(results)
 
@@ -698,8 +694,8 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
         logger.info(
             f"Batch {batch_idx+1}/{n_batches}: "
             f"{batch_passed}/{len(results)} passed ({len(batch_indices)} problems x {cfg.num_rollouts} rollouts), "
-            f"{len(new_failures)} new failures, {len(new_passes)} new passes "
-            f"({len(accumulated_failures)}+{len(accumulated_passes)} accumulated), "
+            f"{batch_eligible_failures}/{batch_total_failures} eligible failures "
+            f"({len(accumulated_failures)} accumulated), "
             f"group_reward={group_mean_reward:.2f}"
         )
 
@@ -716,26 +712,31 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
             "group/pass_rate": batch_passed / max(1, len(results)),
             "group/groups_with_variance": total_groups_with_variance,
             "group/total_groups": total_groups,
+            "train/mixed_group_fraction": mixed_group_fraction,
+            "train/eligible_failure_fraction": eligible_failure_fraction,
+            "train/skipped_all_fail_groups": float(batch_skipped_all_fail_groups),
         }
         _log_wandb(batch_metrics, step=total_graded)
 
         # 2. Check if we have enough trainable examples for an SDPO step
-        total_accumulated = len(accumulated_failures) + len(accumulated_passes)
-        if total_accumulated < cfg.min_sdpo_examples:
+        if len(accumulated_failures) < cfg.min_sdpo_examples:
             continue
 
         # 3. Generate LLM feedback for accumulated failures only (passes skip feedback)
         failures_for_step = accumulated_failures
-        passes_for_step = accumulated_passes
         pass_context_for_step = accumulated_pass_context
+        step_total_groups = accumulated_total_groups
+        step_mixed_groups = accumulated_mixed_groups
+        step_skipped_all_fail_groups = accumulated_skipped_all_fail_groups
+        step_total_failures = accumulated_total_failures
+        step_eligible_failures = accumulated_eligible_failures
         accumulated_failures = []
-        accumulated_passes = []
         accumulated_pass_context = []
-        if cfg.train_signal == "pure_sdpo":
-            for r in failures_for_step:
-                if r.completion is not None:
-                    r.completion.reward = None
-            passes_for_step = []
+        accumulated_total_groups = 0
+        accumulated_mixed_groups = 0
+        accumulated_skipped_all_fail_groups = 0
+        accumulated_total_failures = 0
+        accumulated_eligible_failures = 0
 
         t_feedback = time.monotonic()
 
@@ -776,14 +777,7 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
                 r.error if sdpo_config.include_environment_feedback else None,
             ))
 
-        # Extract reward-only completions from pass GradeResults
-        reward_only = (
-            [r.completion for r in passes_for_step if r.completion is not None]
-            if passes_for_step and cfg.train_signal == "hybrid"
-            else None
-        )
-
-        # 4. SDPO + GRPO gradient step
+        # 4. SDPO gradient step
         t_sdpo = time.monotonic()
         metrics = await sdpo_train_step(
             training_client=training_client,
@@ -792,7 +786,6 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
             sdpo_config=sdpo_config,
             learning_rate=cfg.learning_rate,
             completions_and_feedback=sdpo_tuples,
-            reward_only_completions=reward_only,
         )
         t_done = time.monotonic()
 
@@ -812,8 +805,7 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
             metrics["sdpo_step"] = float(sdpo_steps)
             metrics["batch_idx"] = float(batch_idx)
             metrics["n_failures"] = float(len(failures_for_step))
-            metrics["n_passes"] = float(len(passes_for_step))
-            metrics["n_sdpo_examples"] = float(len(failures_for_step) + len(passes_for_step))
+            metrics["n_sdpo_examples"] = float(len(failures_for_step))
             metrics["batch_pass_rate"] = batch_passed / max(1, len(results))
             metrics["cumulative_pass_rate"] = total_passed / max(1, total_graded)
             metrics["response_length_mean"] = resp_len_mean
@@ -826,6 +818,11 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
             metrics["group/groups_with_variance_pct"] = (
                 total_groups_with_variance / max(1, total_groups)
             )
+            metrics["train/mixed_group_fraction"] = step_mixed_groups / max(1, step_total_groups)
+            metrics["train/eligible_failure_fraction"] = (
+                step_eligible_failures / max(1, step_total_failures)
+            )
+            metrics["train/skipped_all_fail_groups"] = float(step_skipped_all_fail_groups)
             # Time breakdown
             metrics["time_sample_s"] = round(t_sampled - t0, 2)
             metrics["time_feedback_s"] = round(t_sdpo - t_feedback, 2)
@@ -849,8 +846,7 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
             logger.info(
                 f"  SDPO step {sdpo_steps}: loss={metrics.get('loss', 0):.4f} "
                 f"kl={metrics.get('sdpo_kl', 0):.4f} "
-                f"grpo_adv={metrics.get('grpo_reward_adv_mean', 0):.4f} "
-                f"failures={len(failures_for_step)} passes={len(passes_for_step)} "
+                f"failures={len(failures_for_step)} "
                 f"pass_rate={metrics['cumulative_pass_rate']:.1%} "
                 f"[sample={metrics['time_sample_s']:.1f}s feed={metrics['time_feedback_s']:.1f}s sdpo={metrics['time_sdpo_s']:.1f}s]"
             )
@@ -864,7 +860,7 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
         if cfg.save_every > 0 and sdpo_steps > 0 and sdpo_steps % cfg.save_every == 0:
             ckpt_name = f"sdpo_{sdpo_steps:06d}"
             logger.info(f"  Saving checkpoint: {ckpt_name}")
-            checkpoint_utils.save_checkpoint(
+            await checkpoint_utils.save_checkpoint_async(
                 training_client=training_client,
                 name=ckpt_name,
                 log_path=cfg.log_path,
@@ -898,7 +894,7 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
     # Final checkpoint
     if sdpo_steps > 0:
         logger.info("Training complete. Saving final checkpoint...")
-        checkpoint_utils.save_checkpoint(
+        await checkpoint_utils.save_checkpoint_async(
             training_client=training_client,
             name="final",
             log_path=cfg.log_path,

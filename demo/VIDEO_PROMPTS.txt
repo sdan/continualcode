@@ -1,0 +1,7 @@
+Work only in /Users/sdan/Developer/continualcode/demo and find the highest-impact failing test.
+Patch only the root cause with minimal edits in /demo.
+Add or keep only the smallest test needed to prove the fix.
+Run the most targeted demo test command first.
+If targeted test passes, run full demo tests.
+Read first, then use edit_lines; do not overwrite whole files.
+Summarize in 3 bullets: root cause, exact files changed, verification.

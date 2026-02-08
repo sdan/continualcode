@@ -22,7 +22,9 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import termios
 import textwrap
+import tty
 from typing import Any
 
 # Avoid noisy warnings when forking subprocesses after tokenizers parallelism is initialized.
@@ -203,13 +205,11 @@ def _print_change_block(*, old_content: str | None, new_content: str, start_line
         body = _truncate_line(text, usable - len(gutter) - 2)
         print(f"{' ' * pad_left}{gutter}{color}{sign} {body}{RESET}")
 
-    print()
     if old_content is not None:
         for i, line in enumerate(str(old_content).splitlines(), 0):
             emit((start_line + i) if start_line is not None else None, "-", RED, line)
     for i, line in enumerate(str(new_content).splitlines(), 0):
         emit((start_line + i) if start_line is not None else None, "+", GREEN, line)
-    print()
 
 
 async def _shimmer(label: str, stop: asyncio.Event) -> None:
@@ -250,11 +250,10 @@ def _print_assistant(msg: str) -> None:
 
 
 def _print_tool(name: str, summary: str) -> None:
-    print()
     if summary:
         print(f"{GREEN}●{RESET} {BOLD}{name}{RESET}({DIM}{summary}{RESET})")
-        return
-    print(f"{GREEN}●{RESET} {BOLD}{name}{RESET}")
+    else:
+        print(f"{GREEN}●{RESET} {BOLD}{name}{RESET}")
 
 
 def _print_tool_result(success: bool, preview: str) -> None:
@@ -290,6 +289,56 @@ def _prompt_correction(*, prompt: str, suggested: str | None) -> str:
             return CORRECTION_CHIPS[raw]
         if raw:
             return raw
+
+
+def _select_option(options: list[str], prompt: str = "") -> int:
+    """Arrow-key selector. Returns 0-based index of chosen option."""
+    if not sys.stdin.isatty():
+        # Fallback for non-interactive
+        for i, opt in enumerate(options):
+            print(f"  {i + 1}. {opt}")
+        while True:
+            raw = input(f"Select 1-{len(options)}: ").strip()
+            if raw.isdigit() and 1 <= int(raw) <= len(options):
+                return int(raw) - 1
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    idx = 0
+    try:
+        tty.setraw(fd)
+        while True:
+            # Draw options
+            sys.stdout.write(f"\r\033[J")  # clear from cursor down
+            if prompt:
+                sys.stdout.write(f"{DIM}{prompt}{RESET}\r\n")
+            for i, opt in enumerate(options):
+                if i == idx:
+                    sys.stdout.write(f"  {CYAN}❯{RESET} {BOLD}{opt}{RESET}\r\n")
+                else:
+                    sys.stdout.write(f"    {DIM}{opt}{RESET}\r\n")
+            sys.stdout.flush()
+            # Read key
+            ch = os.read(fd, 1)
+            if ch == b'\x1b':
+                seq = os.read(fd, 2)
+                if seq == b'[A':  # up
+                    idx = (idx - 1) % len(options)
+                elif seq == b'[B':  # down
+                    idx = (idx + 1) % len(options)
+            elif ch in (b'\r', b'\n'):
+                break
+            elif ch == b'q' or ch == b'\x03':  # q or ctrl-c
+                idx = -1
+                break
+            # Move cursor back up to redraw
+            lines_up = len(options) + (1 if prompt else 0)
+            sys.stdout.write(f"\033[{lines_up}A")
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        # Clear the menu
+        sys.stdout.write(f"\r\033[J")
+        sys.stdout.flush()
+    return idx
 
 
 def _edit_args_in_editor(args_to_edit: dict[str, Any]) -> dict[str, Any] | None:
@@ -332,7 +381,7 @@ class ContinualCodeApp:
         auto_approve_readonly = cfg.auto_approve_readonly
 
         print(f"\n{BOLD}continualcode{RESET} {DIM}| {model}{RESET}")
-        print(f"{DIM}{os.getcwd()}{RESET}\n")
+        print(f"{DIM}{os.getcwd()}{RESET}")
         last_sdpo_metrics: dict[str, Any] | None = None
 
         print(f"{DIM}initializing...{RESET}", end="", flush=True)
@@ -354,7 +403,7 @@ class ContinualCodeApp:
         await session.init()
 
         _clear_line()
-        print(f"{DIM}ready{RESET}\n")
+        print(f"{DIM}ready{RESET}")
 
         last_tool_feedback: str | None = None
         session_allowed_tools: set[str] = set()
@@ -473,35 +522,30 @@ class ContinualCodeApp:
                         approved = True
                     else:
                         while True:
-                            print(f"{DIM}Approve `{name}`?{RESET}")
-                            print("  1. Yes")
-                            print(f"  2. Yes, allow `{name}` during this session")
-                            print("  3. No")
-                            print("  4. Edit args")
-                            decision = input(f"{DIM}Select 1-4{RESET}: ").strip()
-                            if decision == "1":
+                            choice = _select_option(
+                                ["Yes", f"Yes, always allow `{name}`", "No", "Edit args"],
+                                prompt=f"Approve `{name}`?",
+                            )
+                            if choice == 0:
                                 approved = True
                                 break
-                            if decision == "2":
+                            if choice == 1:
                                 approved = True
                                 session_allowed_tools.add(name)
-                                _print_system(f"Auto-approving `{name}` for this session.")
                                 break
-                            if decision == "3":
+                            if choice == 2 or choice == -1:
                                 correction = _prompt_correction(
                                     prompt=f"{YELLOW}Reason for denying (required){RESET}: ",
                                     suggested=last_tool_feedback,
                                 )
                                 last_tool_feedback = None
                                 break
-                            if decision == "4":
+                            if choice == 3:
                                 edited = _edit_args_in_editor(model_args)
                                 if edited:
                                     edited_args = edited
                                     model_args = edited
-                                    _print_system("args updated")
                                 continue
-                            _print_system("Invalid choice. Select 1, 2, 3, or 4.")
 
                     final_args = edited_args if (approved and edited_args) else model_args
                     if approved and edited_args is not None and original_model_args != final_args:
@@ -596,7 +640,6 @@ class ContinualCodeApp:
                                 f"kl={metrics.get('sdpo_kl',0.0):.4f} "
                                 f"t={int(metrics.get('sdpo_tokens',0))}{RESET}"
                             )
-                    print()
 
             except KeyboardInterrupt:
                 print()
