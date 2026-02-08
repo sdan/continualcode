@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>continualcode</title>
+  <meta name="description" content="Online SDPO for coding agents. Deny, correct, retrain, retry.">
+  <style>
+    @font-face {
+      font-family: 'SF Pro Display';
+      src: url('./fonts/SF-Pro-Display-Regular.woff2') format('woff2');
+      font-weight: 400;
+      font-style: normal;
+      font-display: swap;
+    }
+    @font-face {
+      font-family: 'SF Pro Text';
+      src: url('./fonts/SF-Pro-Text-Regular.otf') format('opentype');
+      font-weight: 400;
+      font-style: normal;
+      font-display: swap;
+    }
+    @font-face {
+      font-family: 'SF Pro Text';
+      src: url('./fonts/SF-Pro-Text-Semibold.otf') format('opentype');
+      font-weight: 600;
+      font-style: normal;
+      font-display: swap;
+    }
+
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --fg: #1a1a1a;
+      --fg1: rgba(0,0,0,0.45);
+      --bg1: rgba(0,0,0,0.06);
+      --blue: #0A84FF;
+      --mono: 'SF Mono', SFMono-Regular, ui-monospace, Menlo, Consolas, monospace;
+    }
+
+    body {
+      background: #fff;
+      color: var(--fg);
+      font-family: 'SF Pro Display', 'SF Pro Text', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif;
+      font-size: 15px;
+      line-height: 1.7;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .page {
+      max-width: 600px;
+      margin: 0 auto;
+      padding: 64px 24px 80px;
+    }
+
+    h1 {
+      font-size: 22px;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+
+    h2 {
+      font-size: 15px;
+      font-weight: 600;
+      margin-top: 40px;
+      margin-bottom: 12px;
+    }
+
+    p { margin-bottom: 14px; }
+
+    a { color: var(--blue); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    strong { font-weight: 600; }
+    code { font-family: var(--mono); font-size: 13px; background: rgba(0,0,0,0.04); padding: 1px 4px; border-radius: 3px; }
+
+    ul { padding-left: 20px; margin-bottom: 14px; }
+    li { margin-bottom: 4px; }
+    ol { padding-left: 20px; margin-bottom: 14px; }
+    ol li { margin-bottom: 6px; }
+
+    .sub { color: var(--fg1); font-size: 14px; margin-bottom: 20px; }
+    .sub a { color: var(--fg1); }
+    .sub a:hover { color: var(--fg); }
+
+    pre {
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.55;
+      background: rgba(0,0,0,0.03);
+      border: 1px solid var(--bg1);
+      border-radius: 6px;
+      padding: 12px 14px;
+      overflow-x: auto;
+      margin-bottom: 14px;
+    }
+
+    .figure {
+      margin: 24px 0;
+      border-radius: 6px;
+      overflow: hidden;
+      border: 1px solid var(--bg1);
+    }
+
+    .figure-ph {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0,0,0,0.025);
+      color: var(--fg1);
+      font-size: 13px;
+    }
+
+    .figure-cap {
+      padding: 8px 12px;
+      font-size: 12px;
+      color: var(--fg1);
+      border-top: 1px solid var(--bg1);
+    }
+
+    .fig-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin: 24px 0;
+    }
+    .fig-grid .figure { margin: 0; }
+    @media (max-width: 500px) { .fig-grid { grid-template-columns: 1fr; } }
+
+    /* pipeline */
+    .pipeline {
+      margin: 20px 0;
+      padding: 16px 12px;
+      border-radius: 6px;
+      border: 1px solid var(--bg1);
+      background: rgba(0,0,0,0.015);
+    }
+
+    .pipeline-flow {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px 12px;
+    }
+
+    .pn {
+      padding: 8px 6px;
+      border-radius: 6px;
+      border: 1px solid rgba(0,0,0,0.08);
+      background: #fff;
+      text-align: center;
+      transition: border-color 0.4s, box-shadow 0.4s;
+    }
+
+    .pn-icon { font-size: 11px; font-family: var(--mono); display: block; margin-bottom: 2px; color: var(--fg1); }
+    .pn-t { font-size: 12px; font-weight: 600; display: block; }
+    .pn-d { font-size: 10px; color: var(--fg1); display: block; line-height: 1.3; }
+
+    .pipe-conn {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 0 12px;
+      height: 16px;
+    }
+    .pipe-conn-cell { display: flex; align-items: center; justify-content: center; }
+    .pipe-conn-line { width: 1px; height: 100%; background: var(--bg1); }
+
+    .pipeline.animated .pn {
+      animation: np 6s ease-in-out infinite;
+      animation-delay: calc(var(--i) * 1s);
+    }
+    @keyframes np {
+      0%, 100% { border-color: rgba(0,0,0,0.08); box-shadow: none; }
+      10%, 25% { border-color: rgba(10,132,255,0.3); box-shadow: 0 0 12px 2px rgba(10,132,255,0.08); }
+    }
+
+    @media (max-width: 400px) {
+      .pipeline-flow, .pipe-conn { grid-template-columns: repeat(2, 1fr); }
+    }
+
+    /* advantage bars */
+    .adv { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 20px 0; }
+    @media (max-width: 400px) { .adv { grid-template-columns: 1fr; } }
+
+    .adv-box {
+      padding: 12px;
+      border-radius: 6px;
+      border: 1px solid var(--bg1);
+    }
+
+    .adv-label { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px; color: var(--fg1); margin-bottom: 8px; }
+    .adv-note { font-size: 10px; font-family: var(--mono); color: var(--fg1); text-align: center; margin-top: 6px; }
+
+    .s-bars { display: flex; align-items: flex-end; height: 36px; gap: 2px; }
+    .s-bar { flex: 1; height: 25%; background: rgba(0,0,0,0.08); border-radius: 1px; }
+
+    .t-bars { display: flex; align-items: flex-end; height: 36px; gap: 2px; }
+    .t-bar { flex: 1; border-radius: 1px 1px 0 0; min-width: 3px; }
+    .t-bar.p { background: #22c55e; opacity: 0.65; }
+    .t-bar.n { background: #ef4444; opacity: 0.55; }
+    .t-bar.u { background: rgba(0,0,0,0.06); }
+
+    .adv.visible .t-bar {
+      animation: bg 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
+      animation-delay: calc(var(--bi) * 0.025s);
+    }
+    @keyframes bg { from { height: 0 !important; } }
+
+    /* table */
+    table { width: 100%; border-collapse: collapse; font-size: 13px; margin: 14px 0; }
+    th { text-align: left; font-weight: 600; font-size: 11px; color: var(--fg1); text-transform: uppercase; letter-spacing: 0.3px; padding: 6px 8px 6px 0; border-bottom: 1px solid var(--bg1); }
+    td { padding: 5px 8px 5px 0; border-bottom: 1px solid var(--bg1); }
+    tr:last-child td { border-bottom: none; }
+    .hl { color: var(--blue); font-weight: 600; }
+    .dm { color: var(--fg1); }
+
+    /* footer */
+    hr { border: none; border-top: 1px solid var(--bg1); margin: 40px 0 16px; }
+    .foot { font-size: 12px; color: var(--fg1); display: flex; gap: 16px; flex-wrap: wrap; }
+    .foot a { color: var(--fg1); }
+    .foot a:hover { color: var(--fg); }
+
+    @media (max-width: 500px) {
+      .page { padding: 40px 16px 60px; }
+      h1 { font-size: 20px; }
+    }
+  </style>
+</head>
+<body>
+<div class="page">
+
+  <h1>continualcode</h1>
+  <p class="sub"><a href="https://github.com/prava-ai/continualcode">github</a> &middot; <a href="https://arxiv.org/abs/2601.20802">paper</a> &middot; <a href="./design.md">design doc</a></p>
+
+  <p>A CLI coding agent that learns from your corrections in real time. It has tools (<code>read</code>, <code>write</code>, <code>edit_lines</code>, <code>glob</code>, <code>grep</code>, <code>bash</code>). You approve or deny each tool call. When you deny with a correction, it takes one gradient step on LoRA parameters via <a href="https://self-distillation.github.io/SDPO">SDPO</a> and retries with updated weights. No reward model, no critic, no external teacher — the model conditioned on your correction <em>is</em> the teacher.</p>
+
+<pre>You: "fix the test"
+Agent: write(test.py, ...)       # overwrites the file
+You: n → "use edit_lines; don't overwrite"
+  → SDPO update runs immediately
+  → agent retries with updated weights
+Agent: edit_lines(test.py, 14, 17, ...)
+You: y</pre>
+
+  <!-- screenshot -->
+  <div class="figure">
+    <div class="figure-ph">screenshot — terminal interaction</div>
+    <div class="figure-cap">deny → correct → retrain → retry, in one session</div>
+  </div>
+
+  <h2>Four feedback types, one training signal</h2>
+
+  <p><strong>Approve</strong> — executes the tool call. No gradient step. The absence of correction is the signal.<br>
+  <strong>Deny with correction</strong> — the primary learning event. Your text becomes privileged context for the self-teacher. One gradient step, then retry.<br>
+  <strong>Edit</strong> — you modify the tool call's arguments directly. The diff becomes implicit correction text. Same gradient step, then execute.<br>
+  <strong>Intermediary feedback</strong> — free-form context ("this project uses Poetry not pip"). Accumulates in session, strengthens the teacher signal on the next denial.</p>
+
+  <p>One tool call per turn. This gives clean credit assignment — each correction maps to exactly one set of generated tokens, exactly one gradient step.</p>
+
+  <h2>The self-distillation step</h2>
+
+  <p>When you deny with correction text, the system constructs a teacher by appending the failed attempt and your correction to the conversation. A single forward pass through the <strong>same model</strong> scores the same tokens under the richer context. The per-token advantage is the logprob gap:</p>
+
+<pre>advantage[t] = log π_teacher(token_t) − log π_student(token_t)</pre>
+
+  <p>Tokens where the teacher assigns higher probability get positive advantage — produce more of those. Tokens where it assigns lower get negative — suppress those. This yields <strong>O(N) bits</strong> of learning signal from a single correction, versus O(1) from a scalar reward.</p>
+
+  <p>The update uses importance-sampled policy gradients (not PPO clipping — clipping causes token dropping on rare but critical tokens):</p>
+
+<pre>is_ratio  = π_current(t) / π_old(t)       # clamp [0.5, 2.0]
+pg_loss   = −mean(is_ratio · advantage · log π(t))
+kl_loss   = β · KL(π_θ ‖ π_ref)           # β ≈ 0.04
+total     = pg_loss + kl_loss              # backward through LoRA only</pre>
+
+  <p>The entire step — teacher forward pass, advantages, backward, optimizer step — adds ~2-3s latency on a single GPU with an 8B model. Imperceptible when you just typed a correction.</p>
+
+  <!-- pipeline diagram -->
+  <div class="pipeline" id="pipeline-diagram">
+    <div class="pipeline-flow" style="margin-bottom: 0;">
+      <div class="pn" style="--i:0"><span class="pn-icon">1</span><span class="pn-t">Student</span><span class="pn-d">samples on-policy</span></div>
+      <div class="pn" style="--i:1"><span class="pn-icon">2</span><span class="pn-t">Correction</span><span class="pn-d">your feedback text</span></div>
+      <div class="pn" style="--i:2"><span class="pn-icon">3</span><span class="pn-t">Self-Teacher</span><span class="pn-d">model + feedback</span></div>
+    </div>
+    <div class="pipe-conn">
+      <div class="pipe-conn-cell"></div>
+      <div class="pipe-conn-cell"></div>
+      <div class="pipe-conn-cell"><div class="pipe-conn-line"></div></div>
+    </div>
+    <div class="pipeline-flow">
+      <div class="pn" style="--i:5"><span class="pn-icon">6</span><span class="pn-t">Retry</span><span class="pn-d">updated policy</span></div>
+      <div class="pn" style="--i:4"><span class="pn-icon">5</span><span class="pn-t">LoRA Update</span><span class="pn-d">importance sampling</span></div>
+      <div class="pn" style="--i:3"><span class="pn-icon">4</span><span class="pn-t">Per-Token &Delta;</span><span class="pn-d">KL at each position</span></div>
+    </div>
+  </div>
+
+  <!-- advantage visual -->
+  <div class="adv" id="adv-viz">
+    <div class="adv-box">
+      <div class="adv-label">Scalar reward (RL)</div>
+      <div class="s-bars"><div class="s-bar"></div><div class="s-bar"></div><div class="s-bar"></div><div class="s-bar"></div><div class="s-bar"></div><div class="s-bar"></div><div class="s-bar"></div><div class="s-bar"></div><div class="s-bar"></div><div class="s-bar"></div><div class="s-bar"></div><div class="s-bar"></div></div>
+      <div class="adv-note">O(1) — same signal for all tokens</div>
+    </div>
+    <div class="adv-box">
+      <div class="adv-label">Per-token (SDPO)</div>
+      <div class="t-bars" id="t-bars"></div>
+      <div class="adv-note">O(N) — dense signal at each position</div>
+    </div>
+  </div>
+
+  <h2>Why not the alternatives</h2>
+
+  <p><strong>DPO</strong> needs preference pairs — a chosen and rejected completion. In a CLI you see one tool call. Constructing pairs requires generating a second candidate or using off-policy edits. Also operates at sequence level, no per-token credit.<br>
+  <strong>GRPO</strong> needs multiple samples per prompt (DeepSeek uses 64). Presenting 64 candidates to a developer is absurd UX. Also requires a verifiable reward, which most tool calls lack.<br>
+  <strong>PPO</strong> needs a critic network, doubling memory. Token dropping from clipping prevents learning on rare but critical tokens.<br>
+  <strong>SFT on corrections</strong> is off-policy and causes forgetting. Forward KL is mode-covering — it shifts probability toward new data at the expense of everything else.</p>
+
+  <p>Self-distillation is the unique intersection: dense signal (per-token), on-policy (student's own generations), no extra models (teacher = student + context), mode-seeking stability (reverse KL preserves prior capabilities).</p>
+
+  <h2>Why LoRA specifically</h2>
+
+  <p>LoRA is not just a compute optimization — it's a regularization mechanism. The low-rank constraint limits updates to ~0.1% of base model parameters, physically bounding the weight drift that causes catastrophic forgetting. The base model stays frozen and provides general coding capability. The adapter encodes project-specific patterns from your corrections. Rank 16, applied to attention projections.</p>
+
+  <!-- screenshots -->
+  <div class="fig-grid">
+    <div class="figure">
+      <div class="figure-ph" style="aspect-ratio:4/3">per-token heatmap</div>
+      <div class="figure-cap">token-level advantages over a tool call</div>
+    </div>
+    <div class="figure">
+      <div class="figure-ph" style="aspect-ratio:4/3">training curves</div>
+      <div class="figure-cap">loss + KL after corrections</div>
+    </div>
+  </div>
+
+  <h2>Limitations</h2>
+
+  <p>Tinker returns scalar logprobs, not full distributions — we're limited to reverse KL via the logprob gap (no forward KL, no JSD interpolation). No EMA teacher (Tinker doesn't expose weight-level ops) — teacher update is instant (τ=1.0 vs paper's τ=0.05), more aggressive but fine for single-step updates. Credit assignment assumes one tool call per message.</p>
+
+  <h2>Research lineage</h2>
+
+  <p>Context distillation (<a href="https://arxiv.org/abs/2112.00861">Askell et al. 2021</a>) showed a model can internalize its own prompted behavior into weights. GKD (<a href="https://arxiv.org/abs/2306.13649">Agarwal et al. 2023</a>) proved on-policy distillation eliminates the distribution mismatch that cripples SFT. SDPO (<a href="https://self-distillation.github.io/SDPO">Hübotter et al. 2026</a>) showed the model conditioned on environmental feedback can serve as its own teacher, reaching GRPO accuracy at 10x speed with 7x shorter traces. SDFT (<a href="https://self-distillation.github.io/SDFT.html">Shenfeld et al. 2026</a>) demonstrated that self-distillation enables continual learning without catastrophic forgetting. We fuse these into a single deployable loop for interactive coding.</p>
+
+  <h2>Install</h2>
+
+<pre>pip install continualcode
+export TINKER_API_KEY=&lt;your-key&gt;
+continualcode</pre>
+
+  <p>Config via <code>key=value</code> args:</p>
+
+<pre>continualcode enable_training=false          # inference only
+continualcode model_name=Qwen/Qwen3-4B-Instruct-2507 lora_rank=64
+continualcode save_every=10                  # checkpoint every 10 steps</pre>
+
+  <h2>Code layout</h2>
+
+  <ul>
+    <li><code>train.py</code> — SDPO core: teacher prompt construction, logprob scoring, IS-weighted update, sampler refresh</li>
+    <li><code>tui.py</code> — interactive CLI: approve/deny/edit flow, correction prompt, <code>/metrics</code></li>
+    <li><code>tools.py</code> — tool implementations + structured feedback</li>
+    <li><code>benchmarks/auto_train.py</code> — automated LCB training loop with multi-rollout GRPO + SDPO</li>
+    <li><code>demo/</code> — tiny project for deny → train → retry end-to-end</li>
+  </ul>
+
+  <!-- screenshot -->
+  <div class="figure">
+    <div class="figure-ph" style="aspect-ratio:21/9">screenshot — full session</div>
+    <div class="figure-cap">complete session with /metrics readout</div>
+  </div>
+
+  <h2>References</h2>
+
+  <ul>
+    <li><a href="https://self-distillation.github.io/SDPO">SDPO</a> — Hübotter et al. 2026</li>
+    <li><a href="https://self-distillation.github.io/SDFT.html">SDFT</a> — Shenfeld, Damani, Guestrin 2026</li>
+    <li><a href="https://arxiv.org/abs/2306.13649">GKD</a> — Agarwal et al. 2023</li>
+    <li><a href="./design.md">Design doc</a> — full reasoning for on-policy context distillation in coding agents</li>
+    <li><a href="https://thinkingmachines.ai/tinker">Tinker</a> — training API</li>
+  </ul>
+
+  <hr>
+  <div class="foot">
+    <span>&copy; 2026</span>
+    <a href="https://github.com/prava-ai/continualcode">github</a>
+    <a href="https://arxiv.org/abs/2601.20802">paper</a>
+  </div>
+
+</div>
+
+<script>
+(function(){
+  var c=document.getElementById('t-bars');
+  if(!c)return;
+  [[55,'p'],[30,'p'],[75,'p'],[18,'n'],[40,'n'],[85,'p'],[65,'p'],[12,'u'],[50,'n'],[35,'p'],[90,'p'],[25,'n'],[70,'p'],[45,'p'],[20,'n'],[80,'p']].forEach(function(b,i){
+    var e=document.createElement('div');
+    e.className='t-bar '+b[1];
+    e.style.height=b[0]+'%';
+    e.style.setProperty('--bi',i);
+    c.appendChild(e);
+  });
+})();
+
+(function(){
+  var p=document.getElementById('pipeline-diagram');
+  var a=document.getElementById('adv-viz');
+  var o=new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      if(e.isIntersecting){
+        e.target.classList.add(e.target===p?'animated':'visible');
+      }
+    });
+  },{threshold:0.2});
+  if(p)o.observe(p);
+  if(a)o.observe(a);
+})();
+</script>
+</body>
+</html>
