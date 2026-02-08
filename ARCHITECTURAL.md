@@ -10,10 +10,8 @@ Our SDPO implementation targets the reference at [github.com/self-distillation/S
 |---------|-----------|------|-------|
 | 3-slot reprompt template | `{prompt}{solution}{feedback}` | Same | `SDPOConfig.reprompt_template` |
 | Solution demonstrations | First successful sibling rollout | Same | Built in `auto_train.py` solution map |
-| `dont_distill_on_self_success` | Exclude self from demo pool | Same | Config flag |
 | `remove_thinking_from_demonstration` | Strip `<think>` tags from demo | Same | Regex in `build_teacher_messages` |
 | Environment feedback injection | Append env output to feedback | Same | `include_environment_feedback` flag |
-| IS ratio clipping | `exp(π_current - π_old)` clamped | Same | Forward pass to get current logprobs, clamp ratio |
 | GRPO group reward centering | Binary pass/fail, subtract group mean | Same | `sample_and_grade_group` |
 | Per-token KL advantages | `adv = -(student_lp - teacher_lp)` | Same | Scalar logprob gap |
 
@@ -41,6 +39,7 @@ Our SDPO implementation targets the reference at [github.com/self-distillation/S
 
 | Feature | Why skipped |
 |---------|-------------|
+| IS ratio clipping | Not implemented in the current on-policy path; we use `importance_sampling` directly |
 | `environment_feedback_only_without_solution` | Niche flag — easy to add if needed |
 | `trust-region` teacher regularization | Adds complexity, EMA is the paper's default |
 | Loss aggregation modes (`seq-mean-token-sum`, etc.) | Tinker's `importance_sampling` loss_fn handles internally |
@@ -55,18 +54,18 @@ User → Agent proposes tool call → User denies with correction
                                         ↓
                               record_denial(completion, feedback)
                                         ↓
-                              train_sdpo() → build teacher prompt
-                                           → compute_logprobs (teacher)
-                                           → KL advantages
-                                           → forward_backward (IS loss)
-                                           → optim_step
+                              train_sdpo() → sdpo_train_step(...)
+                                           → teacher scoring + KL advantages
+                                           → forward_backward (IS loss) + optim_step
                                            → refresh sampling client
 ```
 
 - Multi-turn: teacher sees full conversation history + appended reprompt
 - Preserves extension property: student prompt is a prefix of teacher prompt → backend KV-cache reuse
-- No solution demonstrations (human feedback IS the signal)
+- Uses solution demonstrations when the operator edits args and approves the corrected call
+- Uses environment feedback on tool failures when correction is provided
 - Immediate single-example updates (no batching)
+- Optional adaptive KL scaling (`target_adv_abs_mean`) keeps per-token advantages from flatlining
 
 ### 2. Benchmark (auto_train.py)
 
@@ -85,6 +84,7 @@ Sample N rollouts per problem → Sandbox grade → LLM feedback for failures
 - Solution demonstrations from successful sibling rollouts
 - Batched updates: accumulate `min_sdpo_examples` before stepping
 - Two training signals: `pure_sdpo` (KL only) or `hybrid` (KL + GRPO rewards)
+- Both interactive and benchmark paths share the same `sdpo_train_step` core.
 
 ## Key invariant
 

@@ -32,11 +32,9 @@ class Config:
     learning_rate: float | None = None  # None = auto from hyperparam_utils
     lora_rank: int = 32
     kl_coef: float = 1.0
-    is_clip: float = 2.0
 
     # Feature toggles
     enable_training: bool = True
-    enable_sdpo: bool = True
     auto_approve_readonly: bool = False
 
 

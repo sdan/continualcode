@@ -1,0 +1,21 @@
+2026-02-08 03:05:31,798 INFO    MainThread:88829 [wandb_setup.py:_flush():81] Current SDK version is 0.22.0
+2026-02-08 03:05:31,799 INFO    MainThread:88829 [wandb_setup.py:_flush():81] Configure stats pid to 88829
+2026-02-08 03:05:31,799 INFO    MainThread:88829 [wandb_setup.py:_flush():81] Loading settings from /Users/sdan/.config/wandb/settings
+2026-02-08 03:05:31,799 INFO    MainThread:88829 [wandb_setup.py:_flush():81] Loading settings from /Users/sdan/Developer/continualcode/wandb/settings
+2026-02-08 03:05:31,799 INFO    MainThread:88829 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2026-02-08 03:05:31,799 INFO    MainThread:88829 [wandb_init.py:setup_run_log_directory():686] Logging user logs to /Users/sdan/Developer/continualcode/wandb/run-20260208_030531-abh1wn9l/logs/debug.log
+2026-02-08 03:05:31,799 INFO    MainThread:88829 [wandb_init.py:setup_run_log_directory():687] Logging internal logs to /Users/sdan/Developer/continualcode/wandb/run-20260208_030531-abh1wn9l/logs/debug-internal.log
+2026-02-08 03:05:31,799 INFO    MainThread:88829 [wandb_init.py:init():813] calling init triggers
+2026-02-08 03:05:31,799 INFO    MainThread:88829 [wandb_init.py:init():818] wandb.init called with sweep_config: {}
+config: {'model_name': 'Qwen/Qwen3-4B-Instruct-2507', 'teacher_model': None, 'enforce_teacher_tokenizer_compat': True, 'lora_rank': 32, 'learning_rate': 1e-06, 'kl_coef': 1.0, 'train_signal': 'pure_sdpo', 'max_tokens': 16384, 'temperature': 0.7, 'num_rollouts': 4, 'batch_size': 16, 'min_sdpo_examples': 8, 'llm_feedback': True, 'llm_feedback_model': 'gpt-5.2-codex', 'split': 'train', 'max_problems': -1, 'feedback_template': 'Code failed with error:\n{error}\n\nFix the code.', 'skip_solved': True, 'eval_every': 10, 'eval_size': 50, 'eval_split': 'test', '_wandb': {}}
+2026-02-08 03:05:31,799 INFO    MainThread:88829 [wandb_init.py:init():861] starting backend
+2026-02-08 03:05:32,452 INFO    MainThread:88829 [wandb_init.py:init():864] sending inform_init request
+2026-02-08 03:05:32,480 INFO    MainThread:88829 [wandb_init.py:init():872] backend started and connected
+2026-02-08 03:05:32,484 INFO    MainThread:88829 [wandb_init.py:init():942] updated telemetry
+2026-02-08 03:05:32,508 INFO    MainThread:88829 [wandb_init.py:init():966] communicating run to backend with 90.0 second timeout
+2026-02-08 03:05:33,130 INFO    MainThread:88829 [wandb_init.py:init():1017] starting run threads in backend
+2026-02-08 03:05:33,410 INFO    MainThread:88829 [wandb_run.py:_console_start():2506] atexit reg
+2026-02-08 03:05:33,410 INFO    MainThread:88829 [wandb_run.py:_redirect():2354] redirect: wrap_raw
+2026-02-08 03:05:33,410 INFO    MainThread:88829 [wandb_run.py:_redirect():2423] Wrapping output streams.
+2026-02-08 03:05:33,410 INFO    MainThread:88829 [wandb_run.py:_redirect():2446] Redirects installed.
+2026-02-08 03:05:33,412 INFO    MainThread:88829 [wandb_init.py:init():1057] run started, returning control to user process

@@ -52,36 +52,6 @@ from tinker_cookbook.sandbox import SandboxBackend
 
 from continualcode.train import SampledCompletion, SDPOConfig, sdpo_train_step
 
-
-# ---------------------------------------------------------------------------
-# Checkpoint helper (works around ttl_seconds incompatibility)
-# ---------------------------------------------------------------------------
-
-
-async def _save_checkpoint(
-    training_client: tinker.TrainingClient,
-    name: str,
-    log_path: str,
-    loop_state: dict[str, Any],
-    kind: Literal["state", "sampler", "both"] = "both",
-) -> dict[str, str]:
-    """Save checkpoint without ttl_seconds (avoids version mismatch)."""
-    futures = {}
-    if kind in ("state", "both"):
-        futures["state"] = await training_client.save_state_async(name)
-    if kind in ("sampler", "both"):
-        futures["sampler"] = await training_client.save_weights_for_sampler_async(name)
-
-    results = {k: await v.result_async() for k, v in futures.items()}
-    paths = {k + "_path": v.path for k, v in results.items()}
-    logger.info(f"Saved checkpoint '{name}': {paths}")
-
-    full_dict = {"name": name, **loop_state, **paths}
-    ckpt_file = os.path.join(log_path, "checkpoints.jsonl")
-    with open(ckpt_file, "a") as f:
-        f.write(json.dumps(full_dict) + "\n")
-    return paths
-
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -164,14 +134,13 @@ class AutoTrainConfig:
     lora_rank: int = 32
     learning_rate: float = 1e-6                 # lower LR for multi-rollout GRPO (canonical LCB config)
     kl_coef: float = 1.0
-    is_clip: float = 2.0
     train_signal: Literal["pure_sdpo", "hybrid"] = "pure_sdpo"
     max_tokens: int = 16384
     temperature: float = 0.7
     num_rollouts: int = 4                       # rollouts per problem for GRPO contrastive signal
-    batch_size: int = 4                         # problems sampled per batch (smaller = finer-grained curves)
+    batch_size: int = 16                        # problems sampled per batch (smaller = finer-grained curves)
     min_sdpo_examples: int = 8                  # accumulate before SDPO step (more with multi-rollout)
-    sandbox_concurrency: int = 16
+    sandbox_concurrency: int = 64
     sandbox_timeout: int = 6
     sandbox_backend: SandboxBackend = SandboxBackend.MODAL
     split: Literal["train", "test"] = "train"
@@ -182,7 +151,7 @@ class AutoTrainConfig:
     # LLM feedback (on by default — the whole point of SDPO is rich feedback)
     llm_feedback: bool = True
     llm_feedback_model: str = "gpt-5.2-codex"
-    llm_feedback_concurrency: int = 8
+    llm_feedback_concurrency: int = 32
     # Fallback template when llm_feedback=False
     feedback_template: str = "Code failed with error:\n{error}\n\nFix the code."
     # Curriculum: skip problems the model has already solved
@@ -253,47 +222,54 @@ class GradeResult:
     response_text: str = ""   # full model response (for solution demonstrations)
 
 
-async def sample_and_grade(
+async def sample_and_grade_group(
     idx: int,
     row: dict[str, Any],
     sampling_client: tinker.SamplingClient,
     renderer: renderers.Renderer,
     cfg: AutoTrainConfig,
-    sem: asyncio.Semaphore,
-) -> GradeResult:
-    """Sample a solution with logprobs, execute in sandbox, return result."""
-    async with sem:
-        metadata = _ensure_dict(row.get("metadata", {}))
-        tests = _normalize_tests(row.get("tests") or row.get("ground_truth"), metadata)
-        question = _build_question(row)
+    sandbox_sem: asyncio.Semaphore,
+) -> list[GradeResult]:
+    """Sample N rollouts for one problem, grade all, attach group-centered GRPO rewards.
 
-        if not tests or not question:
-            return GradeResult(idx=idx, passed=True, completion=None, code=None, error="", question="")
+    Returns a list of N GradeResults, each with completion.reward set to the
+    centered reward (pass=1, fail=0, then subtract group mean).
 
-        # Build prompt
-        messages = renderer.create_conversation_prefix_with_tools([], "")
-        messages.append(renderers.Message(role="user", content=question))
-        model_input = renderer.build_generation_prompt(messages)
-        prompt_len = model_input.length
+    sandbox_sem throttles concurrent sandbox_check_correctness calls (not API sampling).
+    """
+    metadata = _ensure_dict(row.get("metadata", {}))
+    tests = _normalize_tests(row.get("tests") or row.get("ground_truth"), metadata)
+    question = _build_question(row)
 
-        # Sample with logprobs
-        response: types.SampleResponse = await sampling_client.sample_async(
-            prompt=model_input,
-            num_samples=1,
-            sampling_params=types.SamplingParams(
-                stop=renderer.get_stop_sequences(),
-                max_tokens=cfg.max_tokens,
-                temperature=cfg.temperature,
-            ),
-        )
+    if not tests or not question:
+        return [GradeResult(idx=idx, passed=True, completion=None, code=None, error="", question="")]
 
-        seq = response.sequences[0]
+    # Build prompt once
+    messages = renderer.create_conversation_prefix_with_tools([], "")
+    messages.append(renderers.Message(role="user", content=question))
+    model_input = renderer.build_generation_prompt(messages)
+    prompt_len = model_input.length
+
+    # Sample N rollouts in a single API call.
+    # No semaphore here — Tinker API handles its own concurrency.
+    # The sem only throttles sandbox_check_correctness calls below.
+    response: types.SampleResponse = await sampling_client.sample_async(
+        prompt=model_input,
+        num_samples=cfg.num_rollouts,
+        sampling_params=types.SamplingParams(
+            stop=renderer.get_stop_sequences(),
+            max_tokens=cfg.max_tokens,
+            temperature=cfg.temperature,
+        ),
+    )
+
+    # Grade each rollout in parallel
+    async def _grade_seq(seq: Any) -> GradeResult:
         response_tokens = len(seq.tokens)
         parsed_msg, _ok = renderer.parse_response(seq.tokens)
         content = get_text_content(parsed_msg)
         code = extract_code_from_model(content)
 
-        # Build SampledCompletion for SDPO training
         completion = None
         if seq.logprobs is not None:
             completion = SampledCompletion(
@@ -305,18 +281,17 @@ async def sample_and_grade(
             )
 
         if code is None:
-            # No code block — can't grade or train on this, set completion=None
             return GradeResult(
                 idx=idx, passed=False, completion=None, code=None,
                 error="No code block found in model output", question=question,
                 response_tokens=response_tokens, response_text=content or "",
             )
 
-        # Grade via sandbox (with exception handling to avoid crashing the run)
         try:
-            passed, details = await sandbox_check_correctness(
-                tests, code, timeout=cfg.sandbox_timeout, backend=cfg.sandbox_backend,
-            )
+            async with sandbox_sem:
+                passed, details = await sandbox_check_correctness(
+                    tests, code, timeout=cfg.sandbox_timeout, backend=cfg.sandbox_backend,
+                )
         except Exception as e:
             logger.warning(f"Sandbox error for problem {idx}: {e}")
             return GradeResult(
@@ -335,101 +310,16 @@ async def sample_and_grade(
             response_tokens=response_tokens, response_text=content or "",
         )
 
+    results = await asyncio.gather(*[_grade_seq(seq) for seq in response.sequences])
 
-async def sample_and_grade_group(
-    idx: int,
-    row: dict[str, Any],
-    sampling_client: tinker.SamplingClient,
-    renderer: renderers.Renderer,
-    cfg: AutoTrainConfig,
-    sem: asyncio.Semaphore,
-) -> list[GradeResult]:
-    """Sample N rollouts for one problem, grade all, attach group-centered GRPO rewards.
+    # Compute group-centered GRPO rewards (only over gradeable rollouts)
+    gradeable = [(r, 1.0 if r.passed else 0.0) for r in results if r.completion is not None]
+    if gradeable:
+        mean_reward = sum(raw for _, raw in gradeable) / len(gradeable)
+        for r, raw in gradeable:
+            r.completion.reward = raw - mean_reward
 
-    Returns a list of N GradeResults, each with completion.reward set to the
-    centered reward (pass=1, fail=0, then subtract group mean).
-    """
-    async with sem:
-        metadata = _ensure_dict(row.get("metadata", {}))
-        tests = _normalize_tests(row.get("tests") or row.get("ground_truth"), metadata)
-        question = _build_question(row)
-
-        if not tests or not question:
-            return [GradeResult(idx=idx, passed=True, completion=None, code=None, error="", question="")]
-
-        # Build prompt once
-        messages = renderer.create_conversation_prefix_with_tools([], "")
-        messages.append(renderers.Message(role="user", content=question))
-        model_input = renderer.build_generation_prompt(messages)
-        prompt_len = model_input.length
-
-        # Sample N rollouts in a single API call
-        response: types.SampleResponse = await sampling_client.sample_async(
-            prompt=model_input,
-            num_samples=cfg.num_rollouts,
-            sampling_params=types.SamplingParams(
-                stop=renderer.get_stop_sequences(),
-                max_tokens=cfg.max_tokens,
-                temperature=cfg.temperature,
-            ),
-        )
-
-        # Grade each rollout in parallel
-        async def _grade_seq(seq: Any) -> GradeResult:
-            response_tokens = len(seq.tokens)
-            parsed_msg, _ok = renderer.parse_response(seq.tokens)
-            content = get_text_content(parsed_msg)
-            code = extract_code_from_model(content)
-
-            completion = None
-            if seq.logprobs is not None:
-                completion = SampledCompletion(
-                    prompt_input=model_input,
-                    prompt_messages=list(messages),
-                    tokens=seq.tokens,
-                    logprobs=seq.logprobs,
-                    prompt_len=prompt_len,
-                )
-
-            if code is None:
-                return GradeResult(
-                    idx=idx, passed=False, completion=None, code=None,
-                    error="No code block found in model output", question=question,
-                    response_tokens=response_tokens, response_text=content or "",
-                )
-
-            try:
-                passed, details = await sandbox_check_correctness(
-                    tests, code, timeout=cfg.sandbox_timeout, backend=cfg.sandbox_backend,
-                )
-            except Exception as e:
-                logger.warning(f"Sandbox error for problem {idx}: {e}")
-                return GradeResult(
-                    idx=idx, passed=False, completion=completion, code=code,
-                    error=f"Sandbox execution error: {e}", question=question,
-                    response_tokens=response_tokens, response_text=content or "",
-                )
-
-            stderr = details.get("stderr", "")
-            stdout = details.get("stdout", "")
-            error_text = f"{stderr}\n{stdout}".strip()
-
-            return GradeResult(
-                idx=idx, passed=passed, completion=completion, code=code,
-                error=error_text, question=question,
-                response_tokens=response_tokens, response_text=content or "",
-            )
-
-        results = await asyncio.gather(*[_grade_seq(seq) for seq in response.sequences])
-
-        # Compute group-centered GRPO rewards (only over gradeable rollouts)
-        gradeable = [(r, 1.0 if r.passed else 0.0) for r in results if r.completion is not None]
-        if gradeable:
-            mean_reward = sum(raw for _, raw in gradeable) / len(gradeable)
-            for r, raw in gradeable:
-                r.completion.reward = raw - mean_reward
-
-        return list(results)
+    return list(results)
 
 
 # ---------------------------------------------------------------------------
@@ -510,9 +400,16 @@ def _init_wandb(cfg: AutoTrainConfig) -> Any:
         return None
     try:
         import wandb
+        if cfg.wandb_run_name:
+            run_name = cfg.wandb_run_name
+        else:
+            import time
+            ts = time.strftime("%m%d-%H%M")
+            model_short = cfg.model_name.split("/")[-1]
+            run_name = f"sdpo-{model_short}-r{cfg.num_rollouts}b{cfg.batch_size}-{cfg.train_signal}-{ts}"
         _wandb_run = wandb.init(
             project=cfg.wandb_project,
-            name=cfg.wandb_run_name or f"sdpo-{cfg.model_name.split('/')[-1]}",
+            name=run_name,
             config={
                 "model_name": cfg.model_name,
                 "teacher_model": cfg.teacher_model,
@@ -520,7 +417,6 @@ def _init_wandb(cfg: AutoTrainConfig) -> Any:
                 "lora_rank": cfg.lora_rank,
                 "learning_rate": cfg.learning_rate,
                 "kl_coef": cfg.kl_coef,
-                "is_clip": cfg.is_clip,
                 "train_signal": cfg.train_signal,
                 "max_tokens": cfg.max_tokens,
                 "temperature": cfg.temperature,
@@ -642,7 +538,6 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
     # SDPO config (paper-aligned 3-slot template)
     sdpo_config = SDPOConfig(
         kl_coef=cfg.kl_coef,
-        is_clip=cfg.is_clip,
     )
 
     # Logging: always write metrics JSONL (into log_path by default)
@@ -665,7 +560,7 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
     # Wandb (optional)
     wb_run = _init_wandb(cfg)
 
-    sem = asyncio.Semaphore(cfg.sandbox_concurrency)
+    sandbox_sem = asyncio.Semaphore(cfg.sandbox_concurrency)
     llm_sem = asyncio.Semaphore(cfg.llm_feedback_concurrency)
     n_batches = (len(indices) + cfg.batch_size - 1) // cfg.batch_size
 
@@ -706,7 +601,7 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
 
         # 1. Sample N rollouts per problem + grade batch concurrently
         group_tasks = [
-            sample_and_grade_group(i, dict(ds[i]), sampling_client, renderer, cfg, sem)
+            sample_and_grade_group(i, dict(ds[i]), sampling_client, renderer, cfg, sandbox_sem)
             for i in batch_indices
         ]
         group_results: list[list[GradeResult]] = await asyncio.gather(*group_tasks)
@@ -957,7 +852,7 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
         if cfg.save_every > 0 and sdpo_steps > 0 and sdpo_steps % cfg.save_every == 0:
             ckpt_name = f"sdpo_{sdpo_steps:06d}"
             logger.info(f"  Saving checkpoint: {ckpt_name}")
-            await _save_checkpoint(
+            checkpoint_utils.save_checkpoint(
                 training_client=training_client,
                 name=ckpt_name,
                 log_path=cfg.log_path,
@@ -991,7 +886,7 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
     # Final checkpoint
     if sdpo_steps > 0:
         logger.info("Training complete. Saving final checkpoint...")
-        await _save_checkpoint(
+        checkpoint_utils.save_checkpoint(
             training_client=training_client,
             name="final",
             log_path=cfg.log_path,

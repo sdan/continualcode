@@ -68,6 +68,19 @@ def _summarize_tool_args(tool_name: str, tool_args: dict[str, Any]) -> str:
     return ""
 
 
+def _summarize_arg_edit(old_args: dict[str, Any], new_args: dict[str, Any]) -> str:
+    changed_keys = sorted(
+        key for key in (set(old_args.keys()) | set(new_args.keys()))
+        if old_args.get(key) != new_args.get(key)
+    )
+    preview_new_values = {key: new_args.get(key) for key in changed_keys[:5]}
+    return json.dumps(
+        {"changed_keys": changed_keys, "new_values": preview_new_values},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
 def _extract_text(message: dict[str, Any]) -> str:
     content = message.get("content", "")
     if isinstance(content, list):
@@ -316,7 +329,6 @@ class ContinualCodeApp:
     async def _main(self) -> None:
         cfg = self.config
         model = cfg.model_name
-        enable_sdpo = cfg.enable_sdpo
         auto_approve_readonly = cfg.auto_approve_readonly
 
         print(f"\n{BOLD}continualcode{RESET} {DIM}| {model}{RESET}")
@@ -325,7 +337,7 @@ class ContinualCodeApp:
 
         print(f"{DIM}initializing...{RESET}", end="", flush=True)
 
-        sdpo_config = SDPOConfig(kl_coef=cfg.kl_coef, is_clip=cfg.is_clip)
+        sdpo_config = SDPOConfig(kl_coef=cfg.kl_coef)
         session = ContinualSDPOSession(
             model=model,
             checkpoint=cfg.load_checkpoint_path,
@@ -345,6 +357,7 @@ class ContinualCodeApp:
         print(f"{DIM}ready{RESET}\n")
 
         last_tool_feedback: str | None = None
+        session_allowed_tools: set[str] = set()
 
         while True:
             try:
@@ -450,31 +463,57 @@ class ContinualCodeApp:
                     approved = False
                     edited_args = None
                     correction: str | None = None
+                    edit_correction: str | None = None
+                    edit_solution: str | None = None
+                    original_model_args = json.loads(json.dumps(model_args))
 
                     if auto_approve_readonly and name in READONLY_TOOLS:
                         approved = True
+                    elif name in session_allowed_tools:
+                        approved = True
                     else:
                         while True:
-                            decision = input(f"{DIM}[y]es [n]o [e]dit args{RESET}: ").strip().lower()
-                            if decision == "y":
+                            print(f"{DIM}Approve `{name}`?{RESET}")
+                            print("  1. Yes")
+                            print(f"  2. Yes, allow `{name}` during this session")
+                            print("  3. No")
+                            print("  4. Edit args")
+                            decision = input(f"{DIM}Select 1-4{RESET}: ").strip()
+                            if decision == "1":
                                 approved = True
                                 break
-                            if decision == "e":
-                                edited = _edit_args_in_editor(model_args)
-                                if edited:
-                                    edited_args = edited
-                                    model_args = edited
-                                    _print_system("args updated")
-                                continue
-                            if decision == "n":
+                            if decision == "2":
+                                approved = True
+                                session_allowed_tools.add(name)
+                                _print_system(f"Auto-approving `{name}` for this session.")
+                                break
+                            if decision == "3":
                                 correction = _prompt_correction(
                                     prompt=f"{YELLOW}Reason for denying (required){RESET}: ",
                                     suggested=last_tool_feedback,
                                 )
                                 last_tool_feedback = None
                                 break
+                            if decision == "4":
+                                edited = _edit_args_in_editor(model_args)
+                                if edited:
+                                    edited_args = edited
+                                    model_args = edited
+                                    _print_system("args updated")
+                                continue
+                            _print_system("Invalid choice. Select 1, 2, 3, or 4.")
 
                     final_args = edited_args if (approved and edited_args) else model_args
+                    if approved and edited_args is not None and original_model_args != final_args:
+                        edit_summary = _summarize_arg_edit(original_model_args, final_args)
+                        edit_correction = (
+                            "Use these tool arguments instead of the previous proposal: "
+                            f"{edit_summary}"
+                        )
+                        edit_solution = (
+                            "Approved tool call:\n"
+                            f"{name}({json.dumps(final_args, ensure_ascii=False, sort_keys=True)})"
+                        )
 
                     tool_output = ""
                     tool_success = True
@@ -526,15 +565,24 @@ class ContinualCodeApp:
 
                     # SDPO training on correction
                     if (
-                        enable_sdpo
-                        and completion is not None
+                        completion is not None
                         and session.training_client is not None
-                        and (correction or failure_correction)
+                        and (correction or failure_correction or edit_correction)
                     ):
                         if correction:
                             session.record_denial(completion, correction)
                         if failure_correction:
-                            session.record_denial(completion, failure_correction)
+                            session.record_denial(
+                                completion,
+                                failure_correction,
+                                environment_feedback=tool_feedback or tool_output,
+                            )
+                        if edit_correction:
+                            session.record_denial(
+                                completion,
+                                edit_correction,
+                                solution=edit_solution,
+                            )
                         stop = asyncio.Event()
                         shimmer_task = asyncio.create_task(_shimmer("training", stop))
                         metrics = await session.train_sdpo()
@@ -546,7 +594,6 @@ class ContinualCodeApp:
                                 f"{CYAN}trained{RESET} {DIM}#{int(metrics.get('sdpo_step',0))} "
                                 f"L={metrics.get('loss',0.0):.3f} "
                                 f"kl={metrics.get('sdpo_kl',0.0):.4f} "
-                                f"r={metrics.get('sdpo_ratio_mean',1.0):.2f} "
                                 f"t={int(metrics.get('sdpo_tokens',0))}{RESET}"
                             )
                     print()

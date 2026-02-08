@@ -54,7 +54,6 @@ class SDPOConfig:
     """Configuration for SDPO training — aligned with the paper's SelfDistillationConfig."""
 
     kl_coef: float = 1.0
-    is_clip: float = 2.0
 
     # Reprompt templates (paper's 3-slot structure)
     reprompt_template: str = (
@@ -71,16 +70,20 @@ class SDPOConfig:
     )
 
     # Behavioral flags
-    dont_distill_on_self_success: bool = False
     remove_thinking_from_demonstration: bool = False
     include_environment_feedback: bool = False
     max_reprompt_len: int = 10240
+    adaptive_kl: bool = True
+    target_adv_abs_mean: float = 0.03
+    adaptive_kl_max_gain: float = 4.0
 
 
 @dataclass
 class SDPODenial:
     completion: SampledCompletion
     feedback: str
+    solution: str | None = None
+    environment_feedback: str | None = None
 
 
 @dataclass
@@ -191,7 +194,7 @@ def build_is_datum(
     This is the single canonical datum constructor for SDPO training. It:
     - Uses create_rightshifted_model_input_and_leftshifted_targets (chunk-preserving)
     - Pads prompt positions with 0.0 for logprobs/advantages
-    - Builds a binary mask (0.0 prompt, 1.0 completion)
+    - Builds binary weights (0.0 prompt, 1.0 completion)
     - Asserts all array lengths match after alignment
     """
     tokens = comp.tokens
@@ -206,11 +209,11 @@ def build_is_datum(
     # Align per-token arrays: 0.0 for prompt positions, real values for completion.
     full_sampling_lp = [0.0] * prompt_len + list(sampling_logprobs)
     full_advantages = [0.0] * prompt_len + list(advantages)
-    full_mask = [0.0] * prompt_len + [1.0] * len(tokens)
+    full_weights = [0.0] * prompt_len + [1.0] * len(tokens)
 
     aligned_sampling_lp = full_sampling_lp[1:]
     aligned_advantages = full_advantages[1:]
-    aligned_mask = full_mask[1:]
+    aligned_weights = full_weights[1:]
 
     seq_len = input_model_input.length
     assert len(target_tokens) == seq_len, (
@@ -222,8 +225,8 @@ def build_is_datum(
     assert len(aligned_advantages) == seq_len, (
         f"Advantages length mismatch: {len(aligned_advantages)} vs {seq_len}"
     )
-    assert len(aligned_mask) == seq_len, (
-        f"Mask length mismatch: {len(aligned_mask)} vs {seq_len}"
+    assert len(aligned_weights) == seq_len, (
+        f"Weights length mismatch: {len(aligned_weights)} vs {seq_len}"
     )
 
     return types.Datum(
@@ -238,8 +241,8 @@ def build_is_datum(
             "advantages": TensorData.from_torch(
                 torch.tensor(aligned_advantages, dtype=torch.float32)
             ),
-            "mask": TensorData.from_torch(
-                torch.tensor(aligned_mask, dtype=torch.float32)
+            "weights": TensorData.from_torch(
+                torch.tensor(aligned_weights, dtype=torch.float32)
             ),
         },
     )
@@ -320,8 +323,6 @@ async def sdpo_train_step(
     total_tokens = 0
     total_reward_adv = 0.0
     total_reward_tokens = 0
-    ratio_sum = 0.0
-    ratio_count = 0
 
     # Dense credit assignment diagnostics
     all_advantages: list[float] = []       # every per-token advantage (KL component only)
@@ -330,6 +331,9 @@ async def sdpo_train_step(
     n_positive_kl = 0                      # tokens where teacher > student (teacher agrees more)
     n_negative_kl = 0                      # tokens where teacher < student (teacher disagrees)
     n_with_solution = 0                    # examples that had a sibling solution demo
+
+    cached_rows: list[tuple[SampledCompletion, list[float], list[float]]] = []
+    raw_kl_deltas: list[float] = []
 
     for (comp, _feedback, _tf, teacher_prompt_len), teacher_lp_raw in zip(teacher_inputs, teacher_lp_results):
         teacher_lp = slice_completion_logprobs(
@@ -348,8 +352,27 @@ async def sdpo_train_step(
         if len(tokens) == 0:
             continue
 
+        cached_rows.append((comp, student_lp, teacher_lp))
+        raw_kl_deltas.extend(
+            t_lp - s_lp for s_lp, t_lp in zip(student_lp, teacher_lp, strict=True)
+        )
+
+    adv_abs_mean_raw = (
+        sum(abs(delta) for delta in raw_kl_deltas) / max(1, len(raw_kl_deltas))
+        if raw_kl_deltas
+        else 0.0
+    )
+    gain = 1.0
+    if sdpo_config.adaptive_kl:
+        target = max(sdpo_config.target_adv_abs_mean, 0.0)
+        unclamped_gain = target / max(1e-6, adv_abs_mean_raw)
+        gain = max(1.0, min(sdpo_config.adaptive_kl_max_gain, unclamped_gain))
+    effective_kl_coef = sdpo_config.kl_coef * gain
+
+    for comp, student_lp, teacher_lp in cached_rows:
+        tokens = comp.tokens
         kl_advantages = [
-            -sdpo_config.kl_coef * (s_lp - t_lp)
+            effective_kl_coef * (t_lp - s_lp)
             for s_lp, t_lp in zip(student_lp, teacher_lp, strict=True)
         ]
 
@@ -398,46 +421,25 @@ async def sdpo_train_step(
     if not datums:
         return {}
 
-    if sdpo_config.is_clip and sdpo_config.is_clip > 0:
-        try:
-            fwd_futures = [
-                await training_client.forward_async([d], loss_fn="importance_sampling")
-                for d in datums
-            ]
-            fwd_results = [await _result(f) for f in fwd_futures]
-
-            for i, fwd in enumerate(fwd_results):
-                out0 = fwd.loss_fn_outputs[0] if fwd.loss_fn_outputs else {}
-                td = out0.get("logprobs")
-                if td is None:
-                    continue
-                target_lp = td.to_torch().flatten().to(torch.float32)
-                sampling_lp = datums[i].loss_fn_inputs["logprobs"].to_torch().flatten().to(torch.float32)
-                adv = datums[i].loss_fn_inputs["advantages"].to_torch().flatten().to(torch.float32)
-                mask = datums[i].loss_fn_inputs["mask"].to_torch().flatten().bool()
-                if not mask.any():
-                    continue
-                ratio = torch.exp(target_lp[mask] - sampling_lp[mask])
-                ratio_clipped = ratio.clamp(max=float(sdpo_config.is_clip))
-                scale = ratio_clipped / torch.clamp(ratio, min=1e-12)
-                adv2 = adv.clone()
-                adv2[mask] = adv[mask] * scale
-                datums[i].loss_fn_inputs["advantages"] = TensorData.from_torch(adv2)
-                ratio_sum += ratio.mean().item()
-                ratio_count += 1
-        except Exception as e:
-            logger.warning(f"IS clipping forward pass failed, skipping clip: {e}")
-
-    fwd_future = await training_client.forward_backward_async(datums, loss_fn="importance_sampling")
-
     adam_params = types.AdamParams(
         learning_rate=learning_rate,
         beta1=0.9,
         beta2=0.95,
         eps=1e-8,
     )
-    optim_future = await training_client.optim_step_async(adam_params)
 
+    # Strip "weights" from datums before sending — the IS loss function only accepts
+    # target_tokens, logprobs, advantages. Weights are used client-side only.
+    def _strip_weights(datum: types.Datum) -> types.Datum:
+        return types.Datum(
+            model_input=datum.model_input,
+            loss_fn_inputs={k: v for k, v in datum.loss_fn_inputs.items() if k != "weights"},
+        )
+
+    fwd_future = await training_client.forward_backward_async(
+        [_strip_weights(d) for d in datums], loss_fn="importance_sampling"
+    )
+    optim_future = await training_client.optim_step_async(adam_params)
     fwd_bwd = await _result(fwd_future)
     optim_result = await _result(optim_future)
 
@@ -447,7 +449,6 @@ async def sdpo_train_step(
         loss_sum = fwd_metrics.get("loss")
 
     avg_kl = total_kl / max(1, total_tokens)
-    ratio_mean = (ratio_sum / ratio_count) if ratio_count > 0 else 1.0
     avg_reward_adv = total_reward_adv / max(1, total_reward_tokens)
 
     # Advantage distribution stats (the "is SDPO actually giving dense signal?" check)
@@ -483,10 +484,10 @@ async def sdpo_train_step(
         "sdpo_total_datums": float(len(datums)),
         "sdpo_tokens": float(total_tokens),
         "sdpo_kl": float(avg_kl),
-        "sdpo_ratio_mean": float(ratio_mean),
         "grpo_reward_adv_mean": float(avg_reward_adv),
         "loss": float(loss_sum) if loss_sum is not None else 0.0,
         # Dense credit assignment diagnostics
+        "credit/adv_abs_mean_raw": float(adv_abs_mean_raw),
         "credit/adv_mean": float(adv_mean),
         "credit/adv_abs_mean": float(adv_abs_mean),
         "credit/adv_std": float(adv_std),
@@ -494,6 +495,8 @@ async def sdpo_train_step(
         "credit/adv_abs_p90": float(adv_abs_p90),
         "credit/adv_abs_max": float(adv_abs_max),
         "credit/adv_sparsity": float(adv_sparsity),
+        "credit/kl_gain": float(gain),
+        "credit/kl_coef_effective": float(effective_kl_coef),
         # KL sign: fraction of tokens where teacher is more confident
         "credit/kl_positive_frac": float(kl_positive_frac),
         # Solution demo coverage
@@ -530,7 +533,6 @@ class ContinualSDPOSession:
     - Episode tracking for SDPO training
     - Teacher prompt construction from feedback
     - Token-level reverse KL computation
-    - IS ratio clipping
     """
 
     def __init__(
@@ -686,15 +688,18 @@ class ContinualSDPOSession:
         self.messages.clear()
         self._sdpo_episode = None
 
-    @property
-    def prefix_messages(self) -> list[dict[str, Any]]:
-        return list(self._prefix)
-
     # -------------------------------------------------------------------------
     # Episode Tracking
     # -------------------------------------------------------------------------
 
-    def record_denial(self, completion: SampledCompletion | None, feedback: str | None) -> None:
+    def record_denial(
+        self,
+        completion: SampledCompletion | None,
+        feedback: str | None,
+        *,
+        solution: str | None = None,
+        environment_feedback: str | None = None,
+    ) -> None:
         """Record a denied attempt with correction text (the core SDPO signal)."""
         if completion is None:
             return
@@ -703,7 +708,14 @@ class ContinualSDPOSession:
             return
         if self._sdpo_episode is None:
             self._sdpo_episode = SDPOEpisode()
-        self._sdpo_episode.denied.append(SDPODenial(completion=completion, feedback=fb))
+        self._sdpo_episode.denied.append(
+            SDPODenial(
+                completion=completion,
+                feedback=fb,
+                solution=solution,
+                environment_feedback=environment_feedback,
+            )
+        )
 
     # -------------------------------------------------------------------------
     # Sampling
@@ -765,11 +777,8 @@ class ContinualSDPOSession:
         """
         Train using SDPO (self-distillation) on the current approval episode.
 
-        For each denied attempt with correction text:
-        1. Teacher prompt = student prompt + correction
-        2. Compute teacher logprobs on the student's sampled tokens
-        3. Per-token advantage = -kl_coef * (student_lp - teacher_lp)
-        4. Train with tinker loss_fn="importance_sampling" using sampling logprobs as behavior policy.
+        This reuses the shared `sdpo_train_step` implementation, then applies
+        session-specific bookkeeping (sampler refresh, step counter, checkpoints).
         """
         if self.training_client is None:
             return {}
@@ -777,7 +786,7 @@ class ContinualSDPOSession:
         if self._sdpo_episode is None:
             return {}
 
-        if self.sampling_client is None or self.teacher_sampling_client is None:
+        if self.teacher_sampling_client is None:
             return {}
 
         episode = self._sdpo_episode
@@ -785,134 +794,38 @@ class ContinualSDPOSession:
             self._sdpo_episode = None
             return {}
 
-        datums: list[types.Datum] = []
-        total_kl = 0.0
-        total_tokens = 0
-        ratio_sum = 0.0
-        ratio_count = 0
-
-        for denied in episode.denied:
-            comp = denied.completion
-            feedback = denied.feedback
-
-            # Teacher prompt: same context + structured reprompt (no solution/env in human-in-the-loop)
-            teacher_messages = build_teacher_messages(
-                student_prompt_messages=comp.prompt_messages,
-                feedback=feedback,
-                sdpo_config=self.sdpo_config,
-                solution=None,
-                environment_feedback=None,
+        completions_and_feedback = [
+            (
+                denied.completion,
+                denied.feedback,
+                denied.solution,
+                denied.environment_feedback,
             )
-            teacher_prompt = self.renderer.build_generation_prompt(teacher_messages)
-            teacher_prompt_len = teacher_prompt.length
+            for denied in episode.denied
+        ]
 
-            # Teacher logprobs on student's sampled tokens
-            teacher_full = teacher_prompt.append(types.EncodedTextChunk(tokens=comp.tokens))
-            teacher_lp_raw = await self.teacher_sampling_client.compute_logprobs_async(teacher_full)
-            teacher_lp = slice_completion_logprobs(
-                teacher_lp_raw, prompt_len=teacher_prompt_len, completion_len=len(comp.tokens)
-            )
-
-            student_lp = comp.logprobs
-            tokens = comp.tokens
-
-            assert len(tokens) == len(student_lp), (
-                f"Token/logprob length mismatch: {len(tokens)} tokens vs {len(student_lp)} logprobs"
-            )
-            assert len(tokens) == len(teacher_lp), (
-                f"Token/teacher_lp length mismatch: {len(tokens)} tokens vs {len(teacher_lp)} teacher logprobs"
-            )
-            if len(tokens) == 0:
-                continue
-
-            # advantage[t] = -kl_coef * (student_lp[t] - teacher_lp[t])
-            advantages = [
-                -self.sdpo_config.kl_coef * (s_lp - t_lp)
-                for s_lp, t_lp in zip(student_lp, teacher_lp, strict=True)
-            ]
-
-            total_kl += sum(s_lp - t_lp for s_lp, t_lp in zip(student_lp, teacher_lp, strict=True))
-            total_tokens += len(tokens)
-
-            datum = build_is_datum(comp, advantages, student_lp)
-
-            # Optional IS clipping: replace ratio with clipped ratio by scaling advantages.
-            if self.sdpo_config.is_clip and self.sdpo_config.is_clip > 0:
-                try:
-                    fwd_future = await self.training_client.forward_async(
-                        [datum], loss_fn="importance_sampling"
-                    )
-                    fwd = await _result(fwd_future)
-                    out0 = fwd.loss_fn_outputs[0] if fwd.loss_fn_outputs else {}
-                    td = out0.get("logprobs")
-                    if td is not None:
-                        target_lp = td.to_torch().flatten().to(torch.float32)
-                        sampling_lp = datum.loss_fn_inputs["logprobs"].to_torch().flatten().to(torch.float32)
-                        adv = datum.loss_fn_inputs["advantages"].to_torch().flatten().to(torch.float32)
-                        mask = datum.loss_fn_inputs["mask"].to_torch().flatten().bool()
-                        if mask.any():
-                            ratio = torch.exp(target_lp[mask] - sampling_lp[mask])
-                            ratio_clipped = ratio.clamp(max=float(self.sdpo_config.is_clip))
-                            scale = ratio_clipped / torch.clamp(ratio, min=1e-12)
-                            adv2 = adv.clone()
-                            adv2[mask] = adv[mask] * scale
-                            datum.loss_fn_inputs["advantages"] = TensorData.from_torch(adv2)
-                            ratio_sum += ratio.mean().item()
-                            ratio_count += 1
-                except Exception as e:
-                    logger.warning(f"IS clipping forward pass failed, skipping clip: {e}")
-
-            datums.append(datum)
-
-        if not datums:
-            self._sdpo_episode = None
-            return {}
-
-        # Forward-backward with importance sampling loss (async submit)
-        fwd_future = await self.training_client.forward_backward_async(
-            datums, loss_fn="importance_sampling"
-        )
-
-        # Optimizer step (submit immediately to overlap clock cycle)
-        adam_params = types.AdamParams(
+        sdpo_metrics = await sdpo_train_step(
+            training_client=self.training_client,
+            teacher_sampling_client=self.teacher_sampling_client,
+            renderer=self.renderer,
+            sdpo_config=self.sdpo_config,
             learning_rate=self.learning_rate,
-            beta1=0.9,
-            beta2=0.95,
-            eps=1e-8,
+            completions_and_feedback=completions_and_feedback,
+            reward_only_completions=None,
         )
-        optim_future = await self.training_client.optim_step_async(adam_params)
 
-        # Retrieve results
-        fwd_bwd = await _result(fwd_future)
-        await _result(optim_future)
+        # Clear episode regardless of whether this step produced datums.
+        self._sdpo_episode = None
+
+        if not sdpo_metrics:
+            return {}
 
         # Update sampling client to use new weights
         await self._refresh_sampling_client()
 
         self.sdpo_steps += 1
         self._maybe_save_checkpoint()
-
-        # Compute metrics
-        metrics = fwd_bwd.metrics or {}
-        loss_sum = metrics.get("loss:sum") if isinstance(metrics, dict) else None
-        if loss_sum is None and isinstance(metrics, dict):
-            loss_sum = metrics.get("loss")
-
-        avg_kl = total_kl / max(1, total_tokens)
-        ratio_mean = (ratio_sum / ratio_count) if ratio_count > 0 else 1.0
-
-        sdpo_metrics = {
-            "sdpo_step": float(self.sdpo_steps),
-            "sdpo_denied_count": float(len(episode.denied)),
-            "sdpo_tokens": float(total_tokens),
-            "sdpo_kl": float(avg_kl),
-            "sdpo_ratio_mean": float(ratio_mean),
-            "loss": float(loss_sum) if loss_sum is not None else 0.0,
-        }
-
-        # Clear episode
-        self._sdpo_episode = None
-
+        sdpo_metrics["sdpo_step"] = float(self.sdpo_steps)
         return sdpo_metrics
 
     # -------------------------------------------------------------------------
