@@ -10,3 +10,16 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# secrets
+.env
+.env.*
+
+# wandb
+wandb/
+
+# checkpoints
+checkpoints/
+
+# misc
+dino-game.js

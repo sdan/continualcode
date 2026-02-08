@@ -1,5 +1,0 @@
-03:05:33 INFO __main__: Starting auto-train: 1518 batches, num_rollouts=4, llm_feedback=True, train_signal=pure_sdpo
-03:05:33 INFO __main__:   Metrics: ./checkpoints/auto-sdpo/metrics.jsonl
-03:05:33 INFO __main__:   Samples: ./checkpoints/auto-sdpo/samples.jsonl
-03:05:33 INFO __main__:   LLM feedback model: gpt-5.2-codex
-03:05:33 INFO __main__:   Wandb: sdpo-lcb

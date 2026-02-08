@@ -1,8 +1,0 @@
-01:04:48 INFO __main__: Starting auto-train: 1518 batches, num_rollouts=4, llm_feedback=True, train_signal=pure_sdpo
-01:04:48 INFO __main__:   Metrics: ./checkpoints/auto-sdpo/metrics.jsonl
-01:04:48 INFO __main__:   Samples: ./checkpoints/auto-sdpo/samples.jsonl
-01:04:48 INFO __main__:   LLM feedback model: gpt-5.2-codex
-01:04:48 INFO __main__:   Wandb: sdpo-lcb
-01:08:25 INFO __main__: Batch 1/1518: 23/64 passed (16 problems x 4 rollouts), 41 new failures, 0 new passes (41+0 accumulated), group_reward=0.36
-01:09:09 INFO tinker.lib.telemetry: Exception logged for session ID: 8ac8e15d-5abc-518c-9655-9206e435c704
-01:09:09 WARNING continualcode.train: forward_backward_async failed converting IS loss inputs; preflighting datums and retrying once.
