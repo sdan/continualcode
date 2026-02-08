@@ -538,6 +538,7 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
     # SDPO config (paper-aligned 3-slot template)
     sdpo_config = SDPOConfig(
         kl_coef=cfg.kl_coef,
+        include_environment_feedback=True,
     )
 
     # Logging: always write metrics JSONL (into log_path by default)
@@ -581,7 +582,9 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
     solved_indices: set[int] = set()  # curriculum: track solved problems
     # Accumulate trainable completions: failures (for KL+GRPO) and passes (for GRPO-only)
     accumulated_failures: list[GradeResult] = []
-    accumulated_passes: list[GradeResult] = []  # GRPO reward-only (keep GradeResult for solution demos)
+    accumulated_passes: list[GradeResult] = []
+    # In pure_sdpo, we still keep pass rollouts for solution demos (not reward training).
+    accumulated_pass_context: list[GradeResult] = []
     # Per-problem difficulty tracking: {problem_idx: {"attempts": int, "first_solve_step": int|None}}
     problem_tracker: dict[int, dict[str, Any]] = {}
     # Group-level stats for GRPO
@@ -664,6 +667,11 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
             for r in new_failures:
                 r.completion.reward = None
             new_passes = []
+            # Keep passes as teacher context only (sibling solution demonstrations).
+            new_pass_context = [
+                r for r in results
+                if r.passed and r.completion is not None and r.response_text
+            ]
         else:
             new_failures = [
                 r for r in results
@@ -675,8 +683,10 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
                 if r.passed and r.completion is not None
                 and r.completion.reward is not None and r.completion.reward != 0.0
             ]
+            new_pass_context = []
         accumulated_failures.extend(new_failures)
         accumulated_passes.extend(new_passes)
+        accumulated_pass_context.extend(new_pass_context)
         total_passed += batch_passed
         total_graded += len(results)
 
@@ -717,8 +727,10 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
         # 3. Generate LLM feedback for accumulated failures only (passes skip feedback)
         failures_for_step = accumulated_failures
         passes_for_step = accumulated_passes
+        pass_context_for_step = accumulated_pass_context
         accumulated_failures = []
         accumulated_passes = []
+        accumulated_pass_context = []
         if cfg.train_signal == "pure_sdpo":
             for r in failures_for_step:
                 if r.completion is not None:
@@ -729,7 +741,7 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
 
         # Build solution lookup: problem_idx -> first successful response text (for demos)
         solution_by_idx: dict[int, str] = {}
-        for r in passes_for_step:
+        for r in pass_context_for_step:
             if r.idx not in solution_by_idx and r.response_text:
                 solution_by_idx[r.idx] = r.response_text
 
