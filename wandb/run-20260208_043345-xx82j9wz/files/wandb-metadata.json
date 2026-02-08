@@ -1,0 +1,38 @@
+{
+  "os":  "macOS-15.6.1-arm64-arm-64bit",
+  "python":  "CPython 3.12.8",
+  "startedAt":  "2026-02-08T12:33:45.084602Z",
+  "args":  [
+    "wandb_project=sdpo-lcb"
+  ],
+  "program":  "-m continualcode.benchmarks.auto_train",
+  "git":  {
+    "remote":  "https://github.com/sdan/continualcode.git",
+    "commit":  "0ecf0231f7be47f67b52ca9ec4a5ae496406c00f"
+  },
+  "email":  "git@sdan.cc",
+  "root":  "/Users/sdan/Developer/continualcode",
+  "host":  "sdan",
+  "executable":  "/Users/sdan/miniforge3/bin/python",
+  "cpu_count":  10,
+  "cpu_count_logical":  10,
+  "disk":  {
+    "/":  {
+      "total":  "1995218165760",
+      "used":  "1869327155200"
+    }
+  },
+  "memory":  {
+    "total":  "68719476736"
+  },
+  "apple":  {
+    "name":  "Apple M1 Max",
+    "ecpuCores":  2,
+    "pcpuCores":  8,
+    "gpuCores":  32,
+    "memoryGb":  64,
+    "swapTotalBytes":  "9663676416",
+    "ramTotalBytes":  "68719476736"
+  },
+  "writerId":  "lrenn8zzdyufif2540qslmxtatv669d0"
+}

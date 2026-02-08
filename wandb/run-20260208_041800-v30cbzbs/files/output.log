@@ -1,0 +1,10 @@
+04:18:01 INFO __main__: Starting auto-train: 1518 batches, num_rollouts=4, llm_feedback=True, train_signal=pure_sdpo
+04:18:01 INFO __main__:   Metrics: ./checkpoints/auto-sdpo/metrics.jsonl
+04:18:01 INFO __main__:   Samples: ./checkpoints/auto-sdpo/samples.jsonl
+04:18:01 INFO __main__:   LLM feedback model: gpt-5.2-codex
+04:18:01 INFO __main__:   Wandb: sdpo-lcb
+04:21:10 INFO __main__: Batch 1/1518: 25/64 passed (16 problems x 4 rollouts), 39 new failures, 0 new passes (39+0 accumulated), group_reward=0.39
+04:21:10 INFO openai._base_client: Retrying request to /responses in 0.465991 seconds
+04:22:00 INFO __main__:   SDPO step 1: loss=-6877.5021 kl=0.0462 grpo_adv=0.0000 failures=39 passes=0 pass_rate=39.1% [sample=188.3s feed=31.2s sdpo=16.0s]
+04:27:22 INFO __main__: Batch 2/1518: 31/64 passed (16 problems x 4 rollouts), 33 new failures, 0 new passes (33+0 accumulated), group_reward=0.48
+04:28:14 INFO __main__:   SDPO step 2: loss=-6455.0100 kl=0.0419 grpo_adv=0.0000 failures=33 passes=0 pass_rate=43.8% [sample=321.9s feed=27.6s sdpo=20.9s]

@@ -1,0 +1,60 @@
+04:33:46 INFO __main__: Starting auto-train: 1518 batches, num_rollouts=4, llm_feedback=True, train_signal=pure_sdpo
+04:33:46 INFO __main__:   Metrics: ./checkpoints/auto-sdpo/metrics.jsonl
+04:33:46 INFO __main__:   Samples: ./checkpoints/auto-sdpo/samples.jsonl
+04:33:46 INFO __main__:   LLM feedback model: gpt-5.2-codex
+04:33:46 INFO __main__:   Wandb: sdpo-lcb
+04:36:42 INFO __main__: Batch 1/1518: 22/64 passed (16 problems x 4 rollouts), 42 new failures, 0 new passes (42+0 accumulated), group_reward=0.34
+04:37:36 INFO __main__:   SDPO step 1: loss=-6154.2211 kl=0.0450 grpo_adv=0.0000 failures=42 passes=0 pass_rate=34.4% [sample=175.9s feed=34.0s sdpo=16.4s]
+04:40:36 INFO __main__: Batch 2/1518: 29/64 passed (16 problems x 4 rollouts), 35 new failures, 0 new passes (35+0 accumulated), group_reward=0.45
+04:41:25 INFO __main__:   SDPO step 2: loss=-6885.8934 kl=0.0443 grpo_adv=0.0000 failures=35 passes=0 pass_rate=39.8% [sample=180.3s feed=30.0s sdpo=15.7s]
+04:46:34 INFO __main__: Batch 3/1518: 15/64 passed (16 problems x 4 rollouts), 49 new failures, 0 new passes (49+0 accumulated), group_reward=0.23
+04:46:56 INFO openai._base_client: Retrying request to /responses in 0.489324 seconds
+04:47:40 INFO __main__:   SDPO step 3: loss=-8186.2868 kl=0.0394 grpo_adv=0.0000 failures=49 passes=0 pass_rate=34.4% [sample=308.7s feed=42.0s sdpo=20.5s]
+04:52:29 INFO __main__: Batch 4/1518: 16/64 passed (16 problems x 4 rollouts), 48 new failures, 0 new passes (48+0 accumulated), group_reward=0.25
+04:53:24 INFO __main__:   SDPO step 4: loss=-4331.5774 kl=0.0575 grpo_adv=0.0000 failures=48 passes=0 pass_rate=32.0% [sample=289.9s feed=31.8s sdpo=20.3s]
+04:57:22 INFO __main__: Batch 5/1518: 27/64 passed (16 problems x 4 rollouts), 37 new failures, 0 new passes (37+0 accumulated), group_reward=0.42
+04:58:14 INFO __main__:   SDPO step 5: loss=-8671.9704 kl=0.0425 grpo_adv=0.0000 failures=37 passes=0 pass_rate=34.1% [sample=237.4s feed=31.5s sdpo=17.7s]
+05:00:14 INFO __main__: Batch 6/1518: 29/64 passed (16 problems x 4 rollouts), 35 new failures, 0 new passes (35+0 accumulated), group_reward=0.45
+05:00:57 INFO __main__:   SDPO step 6: loss=-4392.3890 kl=0.0458 grpo_adv=0.0000 failures=35 passes=0 pass_rate=35.9% [sample=120.6s feed=27.9s sdpo=11.6s]
+05:03:48 INFO __main__: Batch 7/1518: 22/64 passed (16 problems x 4 rollouts), 42 new failures, 0 new passes (42+0 accumulated), group_reward=0.34
+05:04:47 INFO __main__:   SDPO step 7: loss=-6834.1513 kl=0.0418 grpo_adv=0.0000 failures=42 passes=0 pass_rate=35.7% [sample=171.3s feed=38.8s sdpo=16.8s]
+05:08:33 INFO __main__: Batch 8/1518: 22/64 passed (16 problems x 4 rollouts), 42 new failures, 0 new passes (42+0 accumulated), group_reward=0.34
+05:09:24 INFO __main__:   SDPO step 8: loss=-4452.6878 kl=0.0584 grpo_adv=0.0000 failures=42 passes=0 pass_rate=35.5% [sample=226.2s feed=29.3s sdpo=18.7s]
+05:11:39 INFO __main__: Batch 9/1518: 30/64 passed (16 problems x 4 rollouts), 34 new failures, 0 new passes (34+0 accumulated), group_reward=0.47
+05:12:18 INFO __main__:   SDPO step 9: loss=668.8172 kl=0.1000 grpo_adv=0.0000 failures=34 passes=0 pass_rate=36.8% [sample=134.8s feed=25.3s sdpo=10.3s]
+05:16:44 INFO __main__: Batch 10/1518: 21/64 passed (16 problems x 4 rollouts), 43 new failures, 0 new passes (43+0 accumulated), group_reward=0.33
+05:17:52 INFO __main__:   SDPO step 10: loss=-11157.3606 kl=0.0280 grpo_adv=0.0000 failures=43 passes=0 pass_rate=36.4% [sample=266.4s feed=42.9s sdpo=22.3s]
+05:17:52 INFO __main__:   Saving checkpoint: sdpo_000010
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/Users/sdan/Developer/continualcode/continualcode/benchmarks/auto_train.py", line 939, in <module>
+    chz.nested_entrypoint(main)
+  File "/Users/sdan/miniforge3/lib/python3.12/site-packages/chz/blueprint/_entrypoint.py", line 39, in inner
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/Users/sdan/miniforge3/lib/python3.12/site-packages/chz/blueprint/_entrypoint.py", line 109, in nested_entrypoint
+    return main(value)
+           ^^^^^^^^^^^
+  File "/Users/sdan/Developer/continualcode/continualcode/benchmarks/auto_train.py", line 935, in main
+    asyncio.run(run_auto_train(config))
+  File "/Users/sdan/miniforge3/lib/python3.12/asyncio/runners.py", line 194, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "/Users/sdan/miniforge3/lib/python3.12/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/sdan/miniforge3/lib/python3.12/asyncio/base_events.py", line 686, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/Users/sdan/Developer/continualcode/continualcode/benchmarks/auto_train.py", line 855, in run_auto_train
+    checkpoint_utils.save_checkpoint(
+  File "/Users/sdan/Developer/master-tinker/tinker_cookbook/utils/trace.py", line 363, in sync_wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/sdan/Developer/master-tinker/tinker_cookbook/checkpoint_utils.py", line 109, in save_checkpoint
+    return asyncio.run(
+           ^^^^^^^^^^^^
+  File "/Users/sdan/miniforge3/lib/python3.12/asyncio/runners.py", line 190, in run
+    raise RuntimeError(
+RuntimeError: asyncio.run() cannot be called from a running event loop
