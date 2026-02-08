@@ -95,40 +95,6 @@
       margin-bottom: 14px;
     }
 
-    .figure {
-      margin: 24px 0;
-      border-radius: 6px;
-      overflow: hidden;
-      border: 1px solid var(--bg1);
-    }
-
-    .figure-ph {
-      width: 100%;
-      aspect-ratio: 16 / 9;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: rgba(0,0,0,0.025);
-      color: var(--fg1);
-      font-size: 13px;
-    }
-
-    .figure-cap {
-      padding: 8px 12px;
-      font-size: 12px;
-      color: var(--fg1);
-      border-top: 1px solid var(--bg1);
-    }
-
-    .fig-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 12px;
-      margin: 24px 0;
-    }
-    .fig-grid .figure { margin: 0; }
-    @media (max-width: 500px) { .fig-grid { grid-template-columns: 1fr; } }
-
     /* pipeline */
     .pipeline {
       margin: 20px 0;
@@ -231,9 +197,11 @@
 <div class="page">
 
   <h1>continualcode</h1>
-  <p class="sub"><a href="https://github.com/prava-ai/continualcode">github</a> &middot; <a href="https://arxiv.org/abs/2601.20802">paper</a> &middot; <a href="./design.md">design doc</a></p>
+  <p class="sub"><a href="https://github.com/sdan/continualcode">github</a> &middot; <a href="https://arxiv.org/abs/2601.20802">paper</a> &middot; <a href="./design.md">design doc</a></p>
 
   <p>A CLI coding agent that learns from your corrections in real time. It has tools (<code>read</code>, <code>write</code>, <code>edit_lines</code>, <code>glob</code>, <code>grep</code>, <code>bash</code>). You approve or deny each tool call. When you deny with a correction, it takes one gradient step on LoRA parameters via <a href="https://self-distillation.github.io/SDPO">SDPO</a> and retries with updated weights. No reward model, no critic, no external teacher — the model conditioned on your correction <em>is</em> the teacher.</p>
+
+<pre>pip install continualcode</pre>
 
 <pre>You: "fix the test"
 Agent: write(test.py, ...)       # overwrites the file
@@ -242,12 +210,6 @@ You: n → "use edit_lines; don't overwrite"
   → agent retries with updated weights
 Agent: edit_lines(test.py, 14, 17, ...)
 You: y</pre>
-
-  <!-- screenshot -->
-  <div class="figure">
-    <div class="figure-ph">screenshot — terminal interaction</div>
-    <div class="figure-cap">deny → correct → retrain → retry, in one session</div>
-  </div>
 
   <h2>Four feedback types, one training signal</h2>
 
@@ -321,18 +283,6 @@ total     = pg_loss + kl_loss              # backward through LoRA only</pre>
 
   <p>LoRA is not just a compute optimization — it's a regularization mechanism. The low-rank constraint limits updates to ~0.1% of base model parameters, physically bounding the weight drift that causes catastrophic forgetting. The base model stays frozen and provides general coding capability. The adapter encodes project-specific patterns from your corrections. Rank 16, applied to attention projections.</p>
 
-  <!-- screenshots -->
-  <div class="fig-grid">
-    <div class="figure">
-      <div class="figure-ph" style="aspect-ratio:4/3">per-token heatmap</div>
-      <div class="figure-cap">token-level advantages over a tool call</div>
-    </div>
-    <div class="figure">
-      <div class="figure-ph" style="aspect-ratio:4/3">training curves</div>
-      <div class="figure-cap">loss + KL after corrections</div>
-    </div>
-  </div>
-
   <h2>Limitations</h2>
 
   <p>Tinker returns scalar logprobs, not full distributions — we're limited to reverse KL via the logprob gap (no forward KL, no JSD interpolation). No EMA teacher (Tinker doesn't expose weight-level ops) — teacher update is instant (τ=1.0 vs paper's τ=0.05), more aggressive but fine for single-step updates. Credit assignment assumes one tool call per message.</p>
@@ -347,11 +297,7 @@ total     = pg_loss + kl_loss              # backward through LoRA only</pre>
 export TINKER_API_KEY=&lt;your-key&gt;
 continualcode</pre>
 
-  <p>Config via <code>key=value</code> args:</p>
-
-<pre>continualcode enable_training=false          # inference only
-continualcode model_name=Qwen/Qwen3-4B-Instruct-2507 lora_rank=64
-continualcode save_every=10                  # checkpoint every 10 steps</pre>
+  <p>Config: <code>continualcode enable_training=false</code> (inference only), <code>model_name=Qwen/Qwen3-4B-Instruct-2507</code>, <code>lora_rank=64</code>, <code>save_every=10</code>.</p>
 
   <h2>Code layout</h2>
 
@@ -362,12 +308,6 @@ continualcode save_every=10                  # checkpoint every 10 steps</pre>
     <li><code>benchmarks/auto_train.py</code> — automated LCB training loop with multi-rollout GRPO + SDPO</li>
     <li><code>demo/</code> — tiny project for deny → train → retry end-to-end</li>
   </ul>
-
-  <!-- screenshot -->
-  <div class="figure">
-    <div class="figure-ph" style="aspect-ratio:21/9">screenshot — full session</div>
-    <div class="figure-cap">complete session with /metrics readout</div>
-  </div>
 
   <h2>References</h2>
 
@@ -382,7 +322,7 @@ continualcode save_every=10                  # checkpoint every 10 steps</pre>
   <hr>
   <div class="foot">
     <span>&copy; 2026</span>
-    <a href="https://github.com/prava-ai/continualcode">github</a>
+    <a href="https://github.com/sdan/continualcode">github</a>
     <a href="https://arxiv.org/abs/2601.20802">paper</a>
   </div>
 
