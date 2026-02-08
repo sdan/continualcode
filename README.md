@@ -75,8 +75,9 @@ See `demo/README.md` for the walkthrough.
 
 ## Documentation
 
-This repo is intentionally small. For the underlying training/sampling APIs, see the Tinker docs:
-https://tinker-docs.thinkingmachines.ai/training-sampling
+- [Design doc](docs/design.md): Why on-policy context distillation, the research lineage, and how it maps to coding agents
+- [Architecture](ARCHITECTURAL.md): Implementation details, paper alignment, Tinker API constraints
+- Tinker docs: https://tinker-docs.thinkingmachines.ai/training-sampling
 
 ## Configuration
 

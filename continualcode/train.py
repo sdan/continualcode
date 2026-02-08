@@ -46,16 +46,35 @@ class SampledCompletion:
     logprobs: list[float]
     prompt_len: int
     reward: float | None = None
+    response_text: str | None = None  # full model response text (for solution demonstrations)
 
 
 @dataclass
 class SDPOConfig:
-    """Configuration for SDPO training."""
+    """Configuration for SDPO training — aligned with the paper's SelfDistillationConfig."""
 
-    kl_coef: float = 1.0            # KL penalty coefficient
-    is_clip: float = 2.0            # Optional IS ratio clipping (effective if doing off-policy updates)
-    feedback_template: str = "User correction: {feedback}"
-    reprompt_suffix: str = "Correctly solve the original question."
+    kl_coef: float = 1.0
+    is_clip: float = 2.0
+
+    # Reprompt templates (paper's 3-slot structure)
+    reprompt_template: str = (
+        "{prompt}{solution}{feedback}\n\n"
+        "Correctly solve the original question.\n"
+    )
+    solution_template: str = (
+        "\nCorrect solution:\n\n"
+        "{successful_previous_attempt}\n\n"
+    )
+    feedback_template: str = (
+        "\nThe following is feedback from your unsuccessful earlier attempt:\n\n"
+        "{feedback_raw}\n\n"
+    )
+
+    # Behavioral flags
+    dont_distill_on_self_success: bool = False
+    remove_thinking_from_demonstration: bool = False
+    include_environment_feedback: bool = False
+    max_reprompt_len: int = 10240
 
 
 @dataclass
@@ -108,19 +127,58 @@ def build_teacher_messages(
     student_prompt_messages: list[dict[str, Any]],
     feedback: str,
     sdpo_config: SDPOConfig,
+    solution: str | None = None,
+    environment_feedback: str | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Teacher context = student context + an extra user message containing:
-    - the user correction text
-    - an instruction to solve correctly
+    Teacher context = full student conversation + appended reprompt message.
 
-    Keeps credit assignment clean: teacher/student differ ONLY by the added feedback.
+    The teacher sees ALL prior messages (system, multi-turn conversation history)
+    so it has the same context as the student. The only difference is an extra user
+    message containing the paper's 3-slot reprompt: {prompt}{solution}{feedback}.
+
+    This avoids the single-message bandit problem: without conversation history,
+    the teacher would score tokens without knowing prior context, making the
+    logprob gap noisy and uninformative.
     """
-    parts: list[str] = []
-    parts.append(sdpo_config.feedback_template.format(feedback=feedback))
-    parts.append(sdpo_config.reprompt_suffix)
-    extra = "\n\n".join(parts)
-    return list(student_prompt_messages) + [{"role": "user", "content": extra}]
+    import re
+
+    # Build prompt text from the last user message (for the reprompt template)
+    prompt_text = ""
+    for msg in reversed(student_prompt_messages):
+        if msg.get("role") == "user":
+            prompt_text = msg.get("content", "")
+            break
+
+    # Build solution section
+    solution_section = ""
+    if solution is not None:
+        demo = solution
+        if sdpo_config.remove_thinking_from_demonstration:
+            demo = re.sub(r'<think>.*?</think>\s*', '', demo, flags=re.DOTALL)
+        solution_section = sdpo_config.solution_template.format(
+            successful_previous_attempt=demo
+        )
+
+    # Build feedback section
+    feedback_raw = feedback
+    if sdpo_config.include_environment_feedback and environment_feedback:
+        feedback_raw = f"{feedback}\n\nEnvironment output:\n{environment_feedback}"
+    feedback_section = sdpo_config.feedback_template.format(feedback_raw=feedback_raw)
+
+    # Assemble reprompt
+    reprompt = sdpo_config.reprompt_template.format(
+        prompt=prompt_text,
+        solution=solution_section,
+        feedback=feedback_section,
+    )
+
+    # Truncate if needed
+    if sdpo_config.max_reprompt_len > 0 and len(reprompt) > sdpo_config.max_reprompt_len:
+        reprompt = reprompt[:sdpo_config.max_reprompt_len]
+
+    # Keep full conversation history, append reprompt as extra user message
+    return list(student_prompt_messages) + [{"role": "user", "content": reprompt}]
 
 
 def build_is_datum(
@@ -225,23 +283,27 @@ async def sdpo_train_step(
     renderer: Any,
     sdpo_config: SDPOConfig,
     learning_rate: float,
-    completions_and_feedback: list[tuple[SampledCompletion, str]],
+    completions_and_feedback: list[tuple[SampledCompletion, str, str | None, str | None]],
+    #                                    ^ comp,         feedback, solution, env_feedback
     reward_only_completions: list[SampledCompletion] | None = None,
 ) -> dict[str, float]:
     """Stateless SDPO+optional reward-only step.
 
-    - `completions_and_feedback`: denied/failing examples with text feedback.
+    - `completions_and_feedback`: denied/failing examples with text feedback,
+      optional solution demonstration, and optional environment feedback.
     - `reward_only_completions`: optional pass examples with scalar centered rewards.
     """
     if not completions_and_feedback and not reward_only_completions:
         return {}
 
     teacher_inputs: list[tuple[SampledCompletion, str, Any, int]] = []
-    for comp, feedback in completions_and_feedback:
+    for comp, feedback, solution, env_feedback in completions_and_feedback:
         teacher_messages = build_teacher_messages(
             student_prompt_messages=comp.prompt_messages,
             feedback=feedback,
             sdpo_config=sdpo_config,
+            solution=solution,
+            environment_feedback=env_feedback,
         )
         teacher_prompt = renderer.build_generation_prompt(teacher_messages)
         teacher_full = teacher_prompt.append(types.EncodedTextChunk(tokens=comp.tokens))
@@ -260,6 +322,14 @@ async def sdpo_train_step(
     total_reward_tokens = 0
     ratio_sum = 0.0
     ratio_count = 0
+
+    # Dense credit assignment diagnostics
+    all_advantages: list[float] = []       # every per-token advantage (KL component only)
+    all_student_lps: list[float] = []      # student logprobs (for entropy proxy)
+    all_teacher_lps: list[float] = []      # teacher logprobs
+    n_positive_kl = 0                      # tokens where teacher > student (teacher agrees more)
+    n_negative_kl = 0                      # tokens where teacher < student (teacher disagrees)
+    n_with_solution = 0                    # examples that had a sibling solution demo
 
     for (comp, _feedback, _tf, teacher_prompt_len), teacher_lp_raw in zip(teacher_inputs, teacher_lp_results):
         teacher_lp = slice_completion_logprobs(
@@ -283,6 +353,16 @@ async def sdpo_train_step(
             for s_lp, t_lp in zip(student_lp, teacher_lp, strict=True)
         ]
 
+        # Track per-token diagnostics
+        all_advantages.extend(kl_advantages)
+        all_student_lps.extend(student_lp)
+        all_teacher_lps.extend(teacher_lp)
+        for s_lp, t_lp in zip(student_lp, teacher_lp, strict=True):
+            if t_lp > s_lp:
+                n_positive_kl += 1  # teacher more confident on this token
+            else:
+                n_negative_kl += 1
+
         reward = _get_reward(comp)
         if reward is not None:
             advantages = [kl_adv + reward for kl_adv in kl_advantages]
@@ -296,6 +376,11 @@ async def sdpo_train_step(
 
         datum = build_is_datum(comp, advantages, student_lp)
         datums.append(datum)
+
+    # Count solution demo coverage from the input tuples
+    for _comp, _fb, solution, _env in completions_and_feedback:
+        if solution is not None:
+            n_with_solution += 1
 
     n_reward_only = 0
     if reward_only_completions:
@@ -365,8 +450,35 @@ async def sdpo_train_step(
     ratio_mean = (ratio_sum / ratio_count) if ratio_count > 0 else 1.0
     avg_reward_adv = total_reward_adv / max(1, total_reward_tokens)
 
+    # Advantage distribution stats (the "is SDPO actually giving dense signal?" check)
+    import math
+    adv_abs = [abs(a) for a in all_advantages] if all_advantages else [0.0]
+    adv_mean = sum(all_advantages) / max(1, len(all_advantages))
+    adv_abs_mean = sum(adv_abs) / max(1, len(adv_abs))
+    adv_abs_sorted = sorted(adv_abs)
+    adv_abs_p50 = adv_abs_sorted[len(adv_abs_sorted) // 2]
+    adv_abs_p90 = adv_abs_sorted[int(len(adv_abs_sorted) * 0.9)]
+    adv_abs_max = adv_abs_sorted[-1] if adv_abs_sorted else 0.0
+    # Sparsity: fraction of tokens with |advantage| > 2x median (concentrated signal = good)
+    adv_sparsity = sum(1 for a in adv_abs if a > 2 * adv_abs_p50) / max(1, len(adv_abs))
+    # Std dev of advantages
+    adv_var = sum((a - adv_mean) ** 2 for a in all_advantages) / max(1, len(all_advantages))
+    adv_std = math.sqrt(adv_var)
+
+    # Student entropy proxy: mean negative logprob (higher = more uncertain)
+    student_entropy_proxy = -sum(all_student_lps) / max(1, len(all_student_lps)) if all_student_lps else 0.0
+    teacher_entropy_proxy = -sum(all_teacher_lps) / max(1, len(all_teacher_lps)) if all_teacher_lps else 0.0
+
+    # KL sign breakdown
+    kl_total = n_positive_kl + n_negative_kl
+    kl_positive_frac = n_positive_kl / max(1, kl_total)
+
+    # Solution demo coverage
+    sdpo_count = len(completions_and_feedback)
+    solution_coverage = n_with_solution / max(1, sdpo_count)
+
     result = {
-        "sdpo_denied_count": float(len(completions_and_feedback)),
+        "sdpo_denied_count": float(sdpo_count),
         "sdpo_reward_only_count": float(n_reward_only),
         "sdpo_total_datums": float(len(datums)),
         "sdpo_tokens": float(total_tokens),
@@ -374,6 +486,22 @@ async def sdpo_train_step(
         "sdpo_ratio_mean": float(ratio_mean),
         "grpo_reward_adv_mean": float(avg_reward_adv),
         "loss": float(loss_sum) if loss_sum is not None else 0.0,
+        # Dense credit assignment diagnostics
+        "credit/adv_mean": float(adv_mean),
+        "credit/adv_abs_mean": float(adv_abs_mean),
+        "credit/adv_std": float(adv_std),
+        "credit/adv_abs_p50": float(adv_abs_p50),
+        "credit/adv_abs_p90": float(adv_abs_p90),
+        "credit/adv_abs_max": float(adv_abs_max),
+        "credit/adv_sparsity": float(adv_sparsity),
+        # KL sign: fraction of tokens where teacher is more confident
+        "credit/kl_positive_frac": float(kl_positive_frac),
+        # Solution demo coverage
+        "credit/solution_coverage": float(solution_coverage),
+        # Entropy proxy (higher = more uncertain policy)
+        "entropy/student": float(student_entropy_proxy),
+        "entropy/teacher": float(teacher_entropy_proxy),
+        "entropy/gap": float(teacher_entropy_proxy - student_entropy_proxy),
     }
 
     if isinstance(fwd_metrics, dict):
@@ -667,11 +795,13 @@ class ContinualSDPOSession:
             comp = denied.completion
             feedback = denied.feedback
 
-            # Teacher prompt: same context + extra feedback message
+            # Teacher prompt: same context + structured reprompt (no solution/env in human-in-the-loop)
             teacher_messages = build_teacher_messages(
                 student_prompt_messages=comp.prompt_messages,
                 feedback=feedback,
                 sdpo_config=self.sdpo_config,
+                solution=None,
+                environment_feedback=None,
             )
             teacher_prompt = self.renderer.build_generation_prompt(teacher_messages)
             teacher_prompt_len = teacher_prompt.length

@@ -185,7 +185,6 @@ class AutoTrainConfig:
     llm_feedback_concurrency: int = 8
     # Fallback template when llm_feedback=False
     feedback_template: str = "Code failed with error:\n{error}\n\nFix the code."
-    reprompt_suffix: str = "Correctly solve the original question."
     # Curriculum: skip problems the model has already solved
     skip_solved: bool = True
     # Held-out eval
@@ -251,6 +250,7 @@ class GradeResult:
     error: str           # stderr + stdout from sandbox
     question: str        # original problem text (for LLM feedback)
     response_tokens: int = 0  # token count of model response
+    response_text: str = ""   # full model response (for solution demonstrations)
 
 
 async def sample_and_grade(
@@ -309,7 +309,7 @@ async def sample_and_grade(
             return GradeResult(
                 idx=idx, passed=False, completion=None, code=None,
                 error="No code block found in model output", question=question,
-                response_tokens=response_tokens,
+                response_tokens=response_tokens, response_text=content or "",
             )
 
         # Grade via sandbox (with exception handling to avoid crashing the run)
@@ -322,7 +322,7 @@ async def sample_and_grade(
             return GradeResult(
                 idx=idx, passed=False, completion=completion, code=code,
                 error=f"Sandbox execution error: {e}", question=question,
-                response_tokens=response_tokens,
+                response_tokens=response_tokens, response_text=content or "",
             )
 
         stderr = details.get("stderr", "")
@@ -332,7 +332,7 @@ async def sample_and_grade(
         return GradeResult(
             idx=idx, passed=passed, completion=completion, code=code,
             error=error_text, question=question,
-            response_tokens=response_tokens,
+            response_tokens=response_tokens, response_text=content or "",
         )
 
 
@@ -395,7 +395,7 @@ async def sample_and_grade_group(
                 return GradeResult(
                     idx=idx, passed=False, completion=None, code=None,
                     error="No code block found in model output", question=question,
-                    response_tokens=response_tokens,
+                    response_tokens=response_tokens, response_text=content or "",
                 )
 
             try:
@@ -407,7 +407,7 @@ async def sample_and_grade_group(
                 return GradeResult(
                     idx=idx, passed=False, completion=completion, code=code,
                     error=f"Sandbox execution error: {e}", question=question,
-                    response_tokens=response_tokens,
+                    response_tokens=response_tokens, response_text=content or "",
                 )
 
             stderr = details.get("stderr", "")
@@ -417,7 +417,7 @@ async def sample_and_grade_group(
             return GradeResult(
                 idx=idx, passed=passed, completion=completion, code=code,
                 error=error_text, question=question,
-                response_tokens=response_tokens,
+                response_tokens=response_tokens, response_text=content or "",
             )
 
         results = await asyncio.gather(*[_grade_seq(seq) for seq in response.sequences])
@@ -639,12 +639,10 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
     tokenizer = get_tokenizer(cfg.model_name)
     renderer = renderers.get_renderer(renderer_name, tokenizer=tokenizer)
 
-    # SDPO config
+    # SDPO config (paper-aligned 3-slot template)
     sdpo_config = SDPOConfig(
         kl_coef=cfg.kl_coef,
         is_clip=cfg.is_clip,
-        feedback_template=cfg.feedback_template,
-        reprompt_suffix=cfg.reprompt_suffix,
     )
 
     # Logging: always write metrics JSONL (into log_path by default)
@@ -688,7 +686,7 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
     solved_indices: set[int] = set()  # curriculum: track solved problems
     # Accumulate trainable completions: failures (for KL+GRPO) and passes (for GRPO-only)
     accumulated_failures: list[GradeResult] = []
-    accumulated_passes: list[SampledCompletion] = []  # GRPO reward-only (no feedback needed)
+    accumulated_passes: list[GradeResult] = []  # GRPO reward-only (keep GradeResult for solution demos)
     # Per-problem difficulty tracking: {problem_idx: {"attempts": int, "first_solve_step": int|None}}
     problem_tracker: dict[int, dict[str, Any]] = {}
     # Group-level stats for GRPO
@@ -778,7 +776,7 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
                 and r.completion.reward is not None and r.completion.reward != 0.0
             ]
             new_passes = [
-                r.completion for r in results
+                r for r in results
                 if r.passed and r.completion is not None
                 and r.completion.reward is not None and r.completion.reward != 0.0
             ]
@@ -833,27 +831,50 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
             passes_for_step = []
 
         t_feedback = time.monotonic()
+
+        # Build solution lookup: problem_idx -> first successful response text (for demos)
+        solution_by_idx: dict[int, str] = {}
+        for r in passes_for_step:
+            if r.idx not in solution_by_idx and r.response_text:
+                solution_by_idx[r.idx] = r.response_text
+
+        # Generate feedback for failures
+        feedback_by_failure: list[str] = []
         if cfg.llm_feedback and failures_for_step:
-            async def _get_feedback(r: GradeResult) -> tuple[SampledCompletion, str]:
+            async def _get_feedback(r: GradeResult) -> str:
                 async with llm_sem:
-                    fb = await generate_llm_feedback(
+                    return await generate_llm_feedback(
                         question=r.question,
                         code=r.code or "(no code extracted)",
                         stderr=r.error,
                         stdout="",
                         model=cfg.llm_feedback_model,
                     )
-                return (r.completion, fb)  # type: ignore[return-value]
 
-            sdpo_pairs = await asyncio.gather(*[_get_feedback(r) for r in failures_for_step])
-            sdpo_pairs = list(sdpo_pairs)
+            feedback_by_failure = list(await asyncio.gather(
+                *[_get_feedback(r) for r in failures_for_step]
+            ))
         elif failures_for_step:
-            sdpo_pairs = [
-                (r.completion, cfg.feedback_template.format(error=r.error))  # type: ignore[misc]
-                for r in failures_for_step
+            feedback_by_failure = [
+                cfg.feedback_template.format(error=r.error) for r in failures_for_step
             ]
-        else:
-            sdpo_pairs = []
+
+        # Build 4-tuples: (completion, feedback, solution_demo, env_feedback)
+        sdpo_tuples: list[tuple[SampledCompletion, str, str | None, str | None]] = []
+        for r, fb in zip(failures_for_step, feedback_by_failure):
+            sdpo_tuples.append((
+                r.completion,  # type: ignore[arg-type]
+                fb,
+                solution_by_idx.get(r.idx),
+                r.error if sdpo_config.include_environment_feedback else None,
+            ))
+
+        # Extract reward-only completions from pass GradeResults
+        reward_only = (
+            [r.completion for r in passes_for_step if r.completion is not None]
+            if passes_for_step and cfg.train_signal == "hybrid"
+            else None
+        )
 
         # 4. SDPO + GRPO gradient step
         t_sdpo = time.monotonic()
@@ -863,8 +884,8 @@ async def run_auto_train(cfg: AutoTrainConfig) -> None:
             renderer=renderer,
             sdpo_config=sdpo_config,
             learning_rate=cfg.learning_rate,
-            completions_and_feedback=sdpo_pairs,
-            reward_only_completions=(passes_for_step if (passes_for_step and cfg.train_signal == "hybrid") else None),
+            completions_and_feedback=sdpo_tuples,
+            reward_only_completions=reward_only,
         )
         t_done = time.monotonic()
 
