@@ -36,12 +36,7 @@ from .tools import READONLY_TOOLS, ToolResult, execute_tool
 
 RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
 BLUE, CYAN, GREEN, YELLOW, RED = "\033[34m", "\033[36m", "\033[32m", "\033[33m", "\033[31m"
-USE_SEPARATOR = False
-USE_USER_BLOCK = False
 USE_ASSIST_BLOCK = True
-NO_BG = False
-
-BG_USER = "\033[48;2;48;48;48m"
 BG_ASSIST = "\033[48;2;38;38;38m"
 FG_MUTED = "\033[38;2;210;210;210m"
 
@@ -56,7 +51,7 @@ CORRECTION_CHIPS: dict[str, str] = {
 # --- Helpers ---
 
 def _summarize_tool_args(tool_name: str, tool_args: dict[str, Any]) -> str:
-    if tool_name in ("bash", "execute"):
+    if tool_name == "bash":
         cmd = str(tool_args.get("cmd", "")).strip()
         return f"$ {cmd}".strip()
     if tool_name == "edit_lines":
@@ -95,11 +90,6 @@ def _parse_tool_calls_from_text(text: str) -> tuple[list[dict[str, Any]], str]:
     return tool_calls, remaining.strip()
 
 
-def _separator() -> str:
-    width = min(os.get_terminal_size().columns, 80)
-    return f"{DIM}{'─' * width}{RESET}"
-
-
 def _print_system(msg: str) -> None:
     print(f"{DIM}{msg}{RESET}")
 
@@ -122,7 +112,7 @@ def _clear_line() -> None:
 
 
 def _bg(code: str) -> str:
-    if NO_BG or not _supports_ansi():
+    if not _supports_ansi():
         return ""
     return code
 
@@ -314,7 +304,7 @@ def _edit_args_in_editor(args_to_edit: dict[str, Any]) -> dict[str, Any] | None:
 
 # --- Main loop ---
 
-class SDPOCodeApp:
+class ContinualCodeApp:
     """Wrapper that accepts CLI args and runs the async main loop."""
 
     def __init__(self, config: Any) -> None:
@@ -358,8 +348,6 @@ class SDPOCodeApp:
 
         while True:
             try:
-                if USE_SEPARATOR:
-                    print(_separator())
                 user_input = input(f"{BLUE}❯{RESET} ").strip()
                 if not user_input:
                     continue
@@ -509,7 +497,7 @@ class SDPOCodeApp:
                         if len(lines) > 1:
                             preview += f" +{len(lines)-1} lines"
                         _print_tool_result(tool_success, preview)
-                        if tool_success and tool_output and name in ("read", "glob", "grep", "bash", "execute"):
+                        if tool_success and tool_output and name in ("read", "glob", "grep", "bash"):
                             stripped = tool_output.strip()
                             if stripped and stripped != "ok":
                                 _print_tool_output(tool_output)
@@ -544,9 +532,9 @@ class SDPOCodeApp:
                         and (correction or failure_correction)
                     ):
                         if correction:
-                            session.record_sdpo_denial(completion, correction)
+                            session.record_denial(completion, correction)
                         if failure_correction:
-                            session.record_sdpo_denial(completion, failure_correction)
+                            session.record_denial(completion, failure_correction)
                         stop = asyncio.Event()
                         shimmer_task = asyncio.create_task(_shimmer("training", stop))
                         metrics = await session.train_sdpo()

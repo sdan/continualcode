@@ -60,9 +60,9 @@ def main(config: Config) -> None:
         )
         sys.exit(1)
 
-    from .tui import SDPOCodeApp
+    from .tui import ContinualCodeApp
 
-    app = SDPOCodeApp(config)
+    app = ContinualCodeApp(config)
     app.run()
 
 

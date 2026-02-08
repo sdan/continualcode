@@ -13,6 +13,7 @@ Key invariant for clean credit assignment: teacher and student differ only by th
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ from tinker import types
 from tinker.types.tensor_data import TensorData
 from tinker_cookbook import checkpoint_utils, hyperparam_utils, model_info
 from tinker_cookbook.renderers import get_renderer
+from tinker_cookbook.supervised.common import create_rightshifted_model_input_and_leftshifted_targets
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
 from .tools import TOOL_SPECS
@@ -43,6 +45,7 @@ class SampledCompletion:
     tokens: list[int]
     logprobs: list[float]
     prompt_len: int
+    reward: float | None = None
 
 
 @dataclass
@@ -69,6 +72,326 @@ class SDPOEpisode:
     """
 
     denied: list[SDPODenial] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers: stateless SDPO step, datum builders, reward utilities
+# ---------------------------------------------------------------------------
+
+
+async def _result(obj: Any) -> Any:
+    """Normalize Tinker Future-like objects: await .result_async() if present, else return as-is."""
+    result_async = getattr(obj, "result_async", None)
+    if callable(result_async):
+        return await result_async()
+    return obj
+
+
+def slice_completion_logprobs(
+    logprobs_full: list[float],
+    *,
+    prompt_len: int,
+    completion_len: int,
+) -> list[float]:
+    """
+    Tinker logprobs are next-token logprobs aligned to token positions.
+    For a prompt of length N and a completion of length T, the completion token
+    logprobs start at index (N-1).
+    """
+    start = max(0, prompt_len - 1)
+    end = start + completion_len
+    return logprobs_full[start:end]
+
+
+def build_teacher_messages(
+    *,
+    student_prompt_messages: list[dict[str, Any]],
+    feedback: str,
+    sdpo_config: SDPOConfig,
+) -> list[dict[str, Any]]:
+    """
+    Teacher context = student context + an extra user message containing:
+    - the user correction text
+    - an instruction to solve correctly
+
+    Keeps credit assignment clean: teacher/student differ ONLY by the added feedback.
+    """
+    parts: list[str] = []
+    parts.append(sdpo_config.feedback_template.format(feedback=feedback))
+    parts.append(sdpo_config.reprompt_suffix)
+    extra = "\n\n".join(parts)
+    return list(student_prompt_messages) + [{"role": "user", "content": extra}]
+
+
+def build_is_datum(
+    comp: SampledCompletion,
+    advantages: list[float],
+    sampling_logprobs: list[float],
+) -> types.Datum:
+    """Build an importance-sampling Datum with right-shifted input, mask, and per-token arrays.
+
+    This is the single canonical datum constructor for SDPO training. It:
+    - Uses create_rightshifted_model_input_and_leftshifted_targets (chunk-preserving)
+    - Pads prompt positions with 0.0 for logprobs/advantages
+    - Builds a binary mask (0.0 prompt, 1.0 completion)
+    - Asserts all array lengths match after alignment
+    """
+    tokens = comp.tokens
+    prompt_len = comp.prompt_len
+
+    # Build full sequence and right-shift using cookbook utility (preserves chunk structure).
+    student_full = comp.prompt_input.append(types.EncodedTextChunk(tokens=tokens))
+    input_model_input, target_tokens = create_rightshifted_model_input_and_leftshifted_targets(
+        list(student_full.chunks)
+    )
+
+    # Align per-token arrays: 0.0 for prompt positions, real values for completion.
+    full_sampling_lp = [0.0] * prompt_len + list(sampling_logprobs)
+    full_advantages = [0.0] * prompt_len + list(advantages)
+    full_mask = [0.0] * prompt_len + [1.0] * len(tokens)
+
+    aligned_sampling_lp = full_sampling_lp[1:]
+    aligned_advantages = full_advantages[1:]
+    aligned_mask = full_mask[1:]
+
+    seq_len = input_model_input.length
+    assert len(target_tokens) == seq_len, (
+        f"Sequence length mismatch after right-shift: input={seq_len}, targets={len(target_tokens)}"
+    )
+    assert len(aligned_sampling_lp) == seq_len, (
+        f"Sampling logprobs length mismatch: {len(aligned_sampling_lp)} vs {seq_len}"
+    )
+    assert len(aligned_advantages) == seq_len, (
+        f"Advantages length mismatch: {len(aligned_advantages)} vs {seq_len}"
+    )
+    assert len(aligned_mask) == seq_len, (
+        f"Mask length mismatch: {len(aligned_mask)} vs {seq_len}"
+    )
+
+    return types.Datum(
+        model_input=input_model_input,
+        loss_fn_inputs={
+            "target_tokens": TensorData.from_torch(
+                torch.tensor(target_tokens, dtype=torch.int64)
+            ),
+            "logprobs": TensorData.from_torch(
+                torch.tensor(aligned_sampling_lp, dtype=torch.float32)
+            ),
+            "advantages": TensorData.from_torch(
+                torch.tensor(aligned_advantages, dtype=torch.float32)
+            ),
+            "mask": TensorData.from_torch(
+                torch.tensor(aligned_mask, dtype=torch.float32)
+            ),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stateless SDPO training step (used by auto_train.py and other callers)
+# ---------------------------------------------------------------------------
+
+
+def _get_reward(comp: SampledCompletion) -> float | None:
+    """Extract the reward field from a SampledCompletion."""
+    if comp.reward is None:
+        return None
+    try:
+        return float(comp.reward)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_reward_only_datum(comp: SampledCompletion) -> types.Datum | None:
+    """Build a reward-only IS datum for GRPO hybrid mode (no teacher KL)."""
+    reward = _get_reward(comp)
+    if reward is None or reward == 0.0:
+        return None
+    tokens = comp.tokens
+    student_lp = comp.logprobs
+    assert len(tokens) == len(student_lp), (
+        f"Token/logprob length mismatch: {len(tokens)} tokens vs {len(student_lp)} logprobs"
+    )
+    if len(tokens) == 0:
+        return None
+    advantages = [reward] * len(tokens)
+    return build_is_datum(comp, advantages, student_lp)
+
+
+async def sdpo_train_step(
+    *,
+    training_client: tinker.TrainingClient,
+    teacher_sampling_client: tinker.SamplingClient,
+    renderer: Any,
+    sdpo_config: SDPOConfig,
+    learning_rate: float,
+    completions_and_feedback: list[tuple[SampledCompletion, str]],
+    reward_only_completions: list[SampledCompletion] | None = None,
+) -> dict[str, float]:
+    """Stateless SDPO+optional reward-only step.
+
+    - `completions_and_feedback`: denied/failing examples with text feedback.
+    - `reward_only_completions`: optional pass examples with scalar centered rewards.
+    """
+    if not completions_and_feedback and not reward_only_completions:
+        return {}
+
+    teacher_inputs: list[tuple[SampledCompletion, str, Any, int]] = []
+    for comp, feedback in completions_and_feedback:
+        teacher_messages = build_teacher_messages(
+            student_prompt_messages=comp.prompt_messages,
+            feedback=feedback,
+            sdpo_config=sdpo_config,
+        )
+        teacher_prompt = renderer.build_generation_prompt(teacher_messages)
+        teacher_full = teacher_prompt.append(types.EncodedTextChunk(tokens=comp.tokens))
+        teacher_inputs.append((comp, feedback, teacher_full, teacher_prompt.length))
+
+    teacher_lp_results: list[list[float]] = []
+    if teacher_inputs:
+        teacher_lp_results = await asyncio.gather(
+            *[teacher_sampling_client.compute_logprobs_async(tf) for _, _, tf, _ in teacher_inputs]
+        )
+
+    datums: list[types.Datum] = []
+    total_kl = 0.0
+    total_tokens = 0
+    total_reward_adv = 0.0
+    total_reward_tokens = 0
+    ratio_sum = 0.0
+    ratio_count = 0
+
+    for (comp, _feedback, _tf, teacher_prompt_len), teacher_lp_raw in zip(teacher_inputs, teacher_lp_results):
+        teacher_lp = slice_completion_logprobs(
+            teacher_lp_raw, prompt_len=teacher_prompt_len, completion_len=len(comp.tokens)
+        )
+
+        student_lp = comp.logprobs
+        tokens = comp.tokens
+
+        assert len(tokens) == len(student_lp), (
+            f"Token/logprob length mismatch: {len(tokens)} tokens vs {len(student_lp)} logprobs"
+        )
+        assert len(tokens) == len(teacher_lp), (
+            f"Token/teacher_lp length mismatch: {len(tokens)} tokens vs {len(teacher_lp)} teacher logprobs"
+        )
+        if len(tokens) == 0:
+            continue
+
+        kl_advantages = [
+            -sdpo_config.kl_coef * (s_lp - t_lp)
+            for s_lp, t_lp in zip(student_lp, teacher_lp, strict=True)
+        ]
+
+        reward = _get_reward(comp)
+        if reward is not None:
+            advantages = [kl_adv + reward for kl_adv in kl_advantages]
+            total_reward_adv += abs(reward) * len(tokens)
+            total_reward_tokens += len(tokens)
+        else:
+            advantages = kl_advantages
+
+        total_kl += sum(s_lp - t_lp for s_lp, t_lp in zip(student_lp, teacher_lp, strict=True))
+        total_tokens += len(tokens)
+
+        datum = build_is_datum(comp, advantages, student_lp)
+        datums.append(datum)
+
+    n_reward_only = 0
+    if reward_only_completions:
+        for comp in reward_only_completions:
+            d = _build_reward_only_datum(comp)
+            if d is not None:
+                datums.append(d)
+                n_reward_only += 1
+                reward = _get_reward(comp)
+                if reward is not None:
+                    total_reward_adv += abs(reward) * len(comp.tokens)
+                    total_reward_tokens += len(comp.tokens)
+                    total_tokens += len(comp.tokens)
+
+    if not datums:
+        return {}
+
+    if sdpo_config.is_clip and sdpo_config.is_clip > 0:
+        try:
+            fwd_futures = [
+                await training_client.forward_async([d], loss_fn="importance_sampling")
+                for d in datums
+            ]
+            fwd_results = [await _result(f) for f in fwd_futures]
+
+            for i, fwd in enumerate(fwd_results):
+                out0 = fwd.loss_fn_outputs[0] if fwd.loss_fn_outputs else {}
+                td = out0.get("logprobs")
+                if td is None:
+                    continue
+                target_lp = td.to_torch().flatten().to(torch.float32)
+                sampling_lp = datums[i].loss_fn_inputs["logprobs"].to_torch().flatten().to(torch.float32)
+                adv = datums[i].loss_fn_inputs["advantages"].to_torch().flatten().to(torch.float32)
+                mask = datums[i].loss_fn_inputs["mask"].to_torch().flatten().bool()
+                if not mask.any():
+                    continue
+                ratio = torch.exp(target_lp[mask] - sampling_lp[mask])
+                ratio_clipped = ratio.clamp(max=float(sdpo_config.is_clip))
+                scale = ratio_clipped / torch.clamp(ratio, min=1e-12)
+                adv2 = adv.clone()
+                adv2[mask] = adv[mask] * scale
+                datums[i].loss_fn_inputs["advantages"] = TensorData.from_torch(adv2)
+                ratio_sum += ratio.mean().item()
+                ratio_count += 1
+        except Exception as e:
+            logger.warning(f"IS clipping forward pass failed, skipping clip: {e}")
+
+    fwd_future = await training_client.forward_backward_async(datums, loss_fn="importance_sampling")
+
+    adam_params = types.AdamParams(
+        learning_rate=learning_rate,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+    )
+    optim_future = await training_client.optim_step_async(adam_params)
+
+    fwd_bwd = await _result(fwd_future)
+    optim_result = await _result(optim_future)
+
+    fwd_metrics = fwd_bwd.metrics or {}
+    loss_sum = fwd_metrics.get("loss:sum") if isinstance(fwd_metrics, dict) else None
+    if loss_sum is None and isinstance(fwd_metrics, dict):
+        loss_sum = fwd_metrics.get("loss")
+
+    avg_kl = total_kl / max(1, total_tokens)
+    ratio_mean = (ratio_sum / ratio_count) if ratio_count > 0 else 1.0
+    avg_reward_adv = total_reward_adv / max(1, total_reward_tokens)
+
+    result = {
+        "sdpo_denied_count": float(len(completions_and_feedback)),
+        "sdpo_reward_only_count": float(n_reward_only),
+        "sdpo_total_datums": float(len(datums)),
+        "sdpo_tokens": float(total_tokens),
+        "sdpo_kl": float(avg_kl),
+        "sdpo_ratio_mean": float(ratio_mean),
+        "grpo_reward_adv_mean": float(avg_reward_adv),
+        "loss": float(loss_sum) if loss_sum is not None else 0.0,
+    }
+
+    if isinstance(fwd_metrics, dict):
+        for k, v in fwd_metrics.items():
+            try:
+                result[f"fwd/{k}"] = float(v)
+            except (TypeError, ValueError):
+                pass
+
+    optim_metrics = getattr(optim_result, "metrics", None)
+    if isinstance(optim_metrics, dict):
+        for k, v in optim_metrics.items():
+            try:
+                result[f"optim/{k}"] = float(v)
+            except (TypeError, ValueError):
+                pass
+
+    return result
 
 
 class ContinualSDPOSession:
@@ -138,7 +461,7 @@ class ContinualSDPOSession:
             "- Use read/glob/grep to locate files when needed.\n"
             "- Use write to create files.\n"
             "- Use edit_lines for line-range changes; use edit only for exact substring edits.\n"
-            "- Use execute (alias of bash) for shell commands.\n"
+            "- Use bash for shell commands.\n"
             "- Use at most ONE tool call per assistant message.\n"
             f"Current directory: {os.getcwd()}\n"
         )
@@ -158,8 +481,6 @@ class ContinualSDPOSession:
         self.messages: list[dict[str, Any]] = []
         self._prefix = self.renderer.create_conversation_prefix_with_tools(self.tool_specs, self.system_prompt)
 
-        # Training step counters
-        self.train_steps = 0
         self.sdpo_steps = 0
 
         # SDPO config and episode tracking
@@ -175,9 +496,8 @@ class ContinualSDPOSession:
                 self.training_client = self.service_client.create_training_client_from_state_with_optimizer(
                     resume_info["state_path"]
                 )
-                self.train_steps = resume_info.get("train_steps", 0)
                 self.sdpo_steps = resume_info.get("sdpo_steps", 0)
-                logger.info(f"Resumed from checkpoint: train_steps={self.train_steps}, sdpo_steps={self.sdpo_steps}")
+                logger.info(f"Resumed from checkpoint: sdpo_steps={self.sdpo_steps}")
             else:
                 # Create LoRA training client
                 self.training_client = await self.service_client.create_lora_training_client_async(
@@ -222,28 +542,16 @@ class ContinualSDPOSession:
         """Save checkpoint if save_every is set and we've hit the interval."""
         if self.save_every <= 0 or self.training_client is None:
             return
-        total_steps = self.train_steps + self.sdpo_steps
-        if total_steps > 0 and total_steps % self.save_every == 0:
+        if self.sdpo_steps > 0 and self.sdpo_steps % self.save_every == 0:
             checkpoint_utils.save_checkpoint(
                 training_client=self.training_client,
-                name=f"{total_steps:06d}",
+                name=f"{self.sdpo_steps:06d}",
                 log_path=self.log_path,
                 kind="state",
-                loop_state={"train_steps": self.train_steps, "sdpo_steps": self.sdpo_steps},
+                loop_state={"sdpo_steps": self.sdpo_steps},
                 ttl_seconds=self.ttl_seconds,
             )
-            logger.info(f"Saved checkpoint at step {total_steps}")
-
-    @staticmethod
-    async def _result(obj: Any) -> Any:
-        """
-        Tinker async APIs sometimes return Future-like objects (with .result_async()).
-        This helper normalizes either a Future-like object or an already-materialized result.
-        """
-        result_async = getattr(obj, "result_async", None)
-        if callable(result_async):
-            return await result_async()
-        return obj
+            logger.info(f"Saved checkpoint at sdpo_step {self.sdpo_steps}")
 
     def clear(self) -> None:
         """Clear conversation and episode state."""
@@ -258,10 +566,6 @@ class ContinualSDPOSession:
     # Episode Tracking
     # -------------------------------------------------------------------------
 
-    def reset_sdpo_episode(self) -> None:
-        """Reset SDPO episode state (call after finishing an approval episode)."""
-        self._sdpo_episode = None
-
     def record_denial(self, completion: SampledCompletion | None, feedback: str | None) -> None:
         """Record a denied attempt with correction text (the core SDPO signal)."""
         if completion is None:
@@ -272,10 +576,6 @@ class ContinualSDPOSession:
         if self._sdpo_episode is None:
             self._sdpo_episode = SDPOEpisode()
         self._sdpo_episode.denied.append(SDPODenial(completion=completion, feedback=fb))
-
-    def record_sdpo_denial(self, completion: SampledCompletion | None, feedback: str | None) -> None:
-        """Backward-compatible alias for record_denial."""
-        self.record_denial(completion, feedback)
 
     # -------------------------------------------------------------------------
     # Sampling
@@ -333,42 +633,6 @@ class ContinualSDPOSession:
     # SDPO Training
     # -------------------------------------------------------------------------
 
-    def _build_teacher_messages(
-        self,
-        *,
-        student_prompt_messages: list[dict[str, Any]],
-        feedback: str,
-    ) -> list[dict[str, Any]]:
-        """
-        Teacher context = student context + an extra user message containing:
-        - the user correction text
-        - an instruction to solve correctly
-
-        This keeps credit assignment clean: teacher/student differ ONLY by the added feedback,
-        but we score the student's actual sampled tokens under both.
-        """
-        parts: list[str] = []
-        parts.append(self.sdpo_config.feedback_template.format(feedback=feedback))
-        parts.append(self.sdpo_config.reprompt_suffix)
-        extra = "\n\n".join(parts)
-        return list(student_prompt_messages) + [{"role": "user", "content": extra}]
-
-    @staticmethod
-    def _slice_completion_logprobs(
-        logprobs_full: list[float],
-        *,
-        prompt_len: int,
-        completion_len: int,
-    ) -> list[float]:
-        """
-        Tinker logprobs are next-token logprobs aligned to token positions.
-        For a prompt of length N and a completion of length T, the completion token
-        logprobs start at index (N-1).
-        """
-        start = max(0, prompt_len - 1)
-        end = start + completion_len
-        return logprobs_full[start:end]
-
     async def train_sdpo(self) -> dict[str, float]:
         """
         Train using SDPO (self-distillation) on the current approval episode.
@@ -404,9 +668,10 @@ class ContinualSDPOSession:
             feedback = denied.feedback
 
             # Teacher prompt: same context + extra feedback message
-            teacher_messages = self._build_teacher_messages(
+            teacher_messages = build_teacher_messages(
                 student_prompt_messages=comp.prompt_messages,
                 feedback=feedback,
+                sdpo_config=self.sdpo_config,
             )
             teacher_prompt = self.renderer.build_generation_prompt(teacher_messages)
             teacher_prompt_len = teacher_prompt.length
@@ -414,63 +679,32 @@ class ContinualSDPOSession:
             # Teacher logprobs on student's sampled tokens
             teacher_full = teacher_prompt.append(types.EncodedTextChunk(tokens=comp.tokens))
             teacher_lp_raw = await self.teacher_sampling_client.compute_logprobs_async(teacher_full)
-            teacher_lp = self._slice_completion_logprobs(
+            teacher_lp = slice_completion_logprobs(
                 teacher_lp_raw, prompt_len=teacher_prompt_len, completion_len=len(comp.tokens)
             )
 
             student_lp = comp.logprobs
             tokens = comp.tokens
 
-            min_len = min(len(tokens), len(student_lp), len(teacher_lp))
-            if min_len <= 0:
+            assert len(tokens) == len(student_lp), (
+                f"Token/logprob length mismatch: {len(tokens)} tokens vs {len(student_lp)} logprobs"
+            )
+            assert len(tokens) == len(teacher_lp), (
+                f"Token/teacher_lp length mismatch: {len(tokens)} tokens vs {len(teacher_lp)} teacher logprobs"
+            )
+            if len(tokens) == 0:
                 continue
-            tokens = tokens[:min_len]
-            student_lp = student_lp[:min_len]
-            teacher_lp = teacher_lp[:min_len]
 
-            # Only reverse-KL shaping is supported for now.
             # advantage[t] = -kl_coef * (student_lp[t] - teacher_lp[t])
             advantages = [
-                -self.sdpo_config.kl_coef * (s_lp - t_lp) for s_lp, t_lp in zip(student_lp, teacher_lp)
+                -self.sdpo_config.kl_coef * (s_lp - t_lp)
+                for s_lp, t_lp in zip(student_lp, teacher_lp, strict=True)
             ]
 
-            total_kl += sum(s_lp - t_lp for s_lp, t_lp in zip(student_lp, teacher_lp))
+            total_kl += sum(s_lp - t_lp for s_lp, t_lp in zip(student_lp, teacher_lp, strict=True))
             total_tokens += len(tokens)
 
-            # Build full token sequence and right-shift for importance_sampling loss.
-            student_full = comp.prompt_input.append(types.EncodedTextChunk(tokens=tokens))
-            full_tokens = list(student_full.to_ints())
-            prompt_len = comp.prompt_len
-
-            input_tokens = full_tokens[:-1]
-            target_tokens = full_tokens[1:]
-
-            full_sampling_lp = [0.0] * prompt_len + list(student_lp)
-            full_advantages = [0.0] * prompt_len + advantages
-
-            aligned_sampling_lp = full_sampling_lp[1:]
-            aligned_advantages = full_advantages[1:]
-
-            min_full = min(len(input_tokens), len(target_tokens), len(aligned_sampling_lp), len(aligned_advantages))
-            input_tokens = input_tokens[:min_full]
-            target_tokens = target_tokens[:min_full]
-            aligned_sampling_lp = aligned_sampling_lp[:min_full]
-            aligned_advantages = aligned_advantages[:min_full]
-
-            datum = types.Datum(
-                model_input=types.ModelInput.from_ints(input_tokens),
-                loss_fn_inputs={
-                    "target_tokens": TensorData.from_torch(
-                        torch.tensor(target_tokens, dtype=torch.int64)
-                    ),
-                    "logprobs": TensorData.from_torch(
-                        torch.tensor(aligned_sampling_lp, dtype=torch.float32)
-                    ),
-                    "advantages": TensorData.from_torch(
-                        torch.tensor(aligned_advantages, dtype=torch.float32)
-                    ),
-                },
-            )
+            datum = build_is_datum(comp, advantages, student_lp)
 
             # Optional IS clipping: replace ratio with clipped ratio by scaling advantages.
             if self.sdpo_config.is_clip and self.sdpo_config.is_clip > 0:
@@ -478,14 +712,14 @@ class ContinualSDPOSession:
                     fwd_future = await self.training_client.forward_async(
                         [datum], loss_fn="importance_sampling"
                     )
-                    fwd = await self._result(fwd_future)
+                    fwd = await _result(fwd_future)
                     out0 = fwd.loss_fn_outputs[0] if fwd.loss_fn_outputs else {}
                     td = out0.get("logprobs")
                     if td is not None:
                         target_lp = td.to_torch().flatten().to(torch.float32)
                         sampling_lp = datum.loss_fn_inputs["logprobs"].to_torch().flatten().to(torch.float32)
                         adv = datum.loss_fn_inputs["advantages"].to_torch().flatten().to(torch.float32)
-                        mask = adv != 0
+                        mask = datum.loss_fn_inputs["mask"].to_torch().flatten().bool()
                         if mask.any():
                             ratio = torch.exp(target_lp[mask] - sampling_lp[mask])
                             ratio_clipped = ratio.clamp(max=float(self.sdpo_config.is_clip))
@@ -495,8 +729,8 @@ class ContinualSDPOSession:
                             datum.loss_fn_inputs["advantages"] = TensorData.from_torch(adv2)
                             ratio_sum += ratio.mean().item()
                             ratio_count += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"IS clipping forward pass failed, skipping clip: {e}")
 
             datums.append(datum)
 
@@ -519,8 +753,8 @@ class ContinualSDPOSession:
         optim_future = await self.training_client.optim_step_async(adam_params)
 
         # Retrieve results
-        fwd_bwd = await self._result(fwd_future)
-        await self._result(optim_future)
+        fwd_bwd = await _result(fwd_future)
+        await _result(optim_future)
 
         # Update sampling client to use new weights
         await self._refresh_sampling_client()

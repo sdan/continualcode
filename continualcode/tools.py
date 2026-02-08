@@ -3,7 +3,7 @@
 Core tool implementations and schemas shared by tinkercode harnesses.
 
 Tool names intentionally match the "Claude Code"-style set:
-read, write, edit, edit_lines, glob, grep, bash, execute
+read, write, edit, edit_lines, glob, grep, bash
 """
 
 from __future__ import annotations
@@ -292,11 +292,6 @@ def tool_bash(args: dict[str, Any]) -> ToolResult:
     except Exception as e:
         return _error_result(f"error: {e}", feedback=f"Command failed: {e}")
 
-def tool_execute(args: dict[str, Any]) -> ToolResult:
-    """Alias for bash command execution"""
-    return tool_bash(args)
-
-
 TOOL_FUNCTIONS: dict[str, Any] = {
     "read": tool_read,
     "write": tool_write,
@@ -305,7 +300,6 @@ TOOL_FUNCTIONS: dict[str, Any] = {
     "glob": tool_glob,
     "grep": tool_grep,
     "bash": tool_bash,
-    "execute": tool_execute,
 }
 
 
@@ -403,17 +397,6 @@ TOOL_SPECS: list[ToolSpec] = [
     {
         "name": "bash",
         "description": "Run a shell command",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "cmd": {"type": "string", "description": "The shell command to run"},
-            },
-            "required": ["cmd"],
-        },
-    },
-    {
-        "name": "execute",
-        "description": "Run a shell command (alias of bash)",
         "parameters": {
             "type": "object",
             "properties": {
