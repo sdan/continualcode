@@ -22,6 +22,20 @@ export TINKER_API_KEY=<your-key>
 continualcode
 ```
 
+## Development
+
+Run lint checks with Ruff:
+
+```bash
+python3 -m ruff check .
+```
+
+If you use `uv`, the equivalent is:
+
+```bash
+uvx ruff check .
+```
+
 ## How it works
 
 Four feedback types, one training signal. Your correction becomes privileged context for a self-teacher (same model, richer input). Per-token KL between teacher and student = dense training signal — O(N) bits per correction, not O(1). One gradient step on LoRA, retry with updated weights.
