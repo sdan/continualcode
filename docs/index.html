@@ -166,7 +166,7 @@
   <h1>continualcode</h1>
   <p class="sub"><a href="https://github.com/sdan/continualcode">github</a> &middot; <a href="https://x.com/sdand/status/2020592622415548621">tweet</a> &middot; <a href="./design.md">design doc</a></p>
 
-  <p>A coding agent that updates its own weights from your corrections. You deny a tool call, type what it should have done, and the model takes a gradient step before retrying.</p>
+  <p>A coding agent that updates its own weights from your corrections. Built on <a href="https://thinkingmachines.ai/tinker">Tinker</a> (a training API) and <a href="https://self-distillation.github.io/SDPO">SDPO</a> (self-distillation policy optimization). You deny a tool call, type what it should have done, and the model takes a gradient step on LoRA before retrying — no reward model, no critic, no external teacher.</p>
 
 <pre>pip install continualcode</pre>
 
