@@ -22,6 +22,24 @@ export TINKER_API_KEY=<your-key>
 continualcode
 ```
 
+## Run tests
+
+You can run the focused tool tests added in this repo with:
+
+```bash
+python3 -m unittest -q tests/test_tools.py
+```
+
+Example output:
+
+```text
+----------------------------------------------------------------------
+Ran 9 tests in 0.003s
+
+OK
+```
+
+
 ## How it works
 
 Four feedback types, one training signal. Your correction becomes privileged context for a self-teacher (same model, richer input). Per-token KL between teacher and student = dense training signal — O(N) bits per correction, not O(1). One gradient step on LoRA, retry with updated weights.
