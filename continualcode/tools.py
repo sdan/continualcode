@@ -173,7 +173,10 @@ def tool_edit(args: dict[str, Any]) -> ToolResult:
 
 
 def tool_edit_lines(args: dict[str, Any]) -> ToolResult:
-    """Edit a file by replacing an inclusive line range (1-based)."""
+    """Edit a file by replacing an inclusive line range (1-based).
+
+    Supports append-at-EOF when start_line=end_line=(file_len+1).
+    """
     path = args["path"]
     if not os.path.isfile(path):
         return _error_result(
@@ -208,12 +211,14 @@ def tool_edit_lines(args: dict[str, Any]) -> ToolResult:
                 "Use 'read' to check file contents first."
             ),
         )
-    if end_line > total_lines:
+    append_at_eof = start_line == total_lines + 1 and end_line == total_lines + 1
+    if end_line > total_lines and not append_at_eof:
         return _error_result(
             "error: end_line beyond end of file",
             feedback=(
                 f"end_line {end_line} is beyond file end (file has {total_lines} lines).\n"
-                "Use 'read' to check file contents first."
+                "Use 'read' to check file contents first, or append by setting\n"
+                "start_line=end_line=file_len+1."
             ),
         )
 
@@ -377,7 +382,10 @@ TOOL_SPECS: list[ToolSpec] = [
     },
     {
         "name": "edit_lines",
-        "description": "Edit a file by replacing an inclusive line range (1-based) with new content.",
+        "description": (
+            "Edit a file by replacing an inclusive line range (1-based) with new content. "
+            "To append at EOF, set start_line=end_line=file_len+1."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
